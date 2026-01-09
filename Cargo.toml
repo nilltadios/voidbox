@@ -1,0 +1,25 @@
+[package]
+name = "void_runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+nix = { version = "0.27", features = ["fs", "sched", "mount", "user", "process", "signal", "hostname"] }
+ureq = { version = "2.9", features = ["json"] }
+flate2 = "1.0"
+tar = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5.0"
+sha2 = "0.10"
+hex = "0.4"
+zip = "0.6"
+walkdir = "2"
+indicatif = "0.17"
+which = "4.4"
+chrono = "0.4"
+
+[profile.release]
+strip = true
+lto = true
