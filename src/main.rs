@@ -14,7 +14,7 @@ use walkdir::WalkDir;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BRAVE_RELEASES_API: &str = "https://api.github.com/repos/brave/brave-browser/releases/latest";
-const UBUNTU_BASE_URL: &str = "http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.2-base-amd64.tar.gz";
+const UBUNTU_RELEASES_URL: &str = "https://cdimage.ubuntu.com/ubuntu-base/releases/";
 
 #[derive(Parser)]
 #[command(name = "void_runner")]
@@ -75,6 +75,7 @@ struct GitHubAsset {
 #[derive(Deserialize, serde::Serialize, Default)]
 struct InstalledInfo {
     brave_version: Option<String>,
+    ubuntu_version: Option<String>,
     installed_date: Option<String>,
 }
 
@@ -104,11 +105,12 @@ fn save_installed_info(data_dir: &Path, info: &InstalledInfo) {
 }
 
 fn fetch_latest_brave_release() -> Result<(String, String), Box<dyn std::error::Error>> {
-    let resp = ureq::get(BRAVE_RELEASES_API)
-        .set("User-Agent", "void_runner")
+    let mut resp = ureq::get(BRAVE_RELEASES_API)
+        .header("User-Agent", "void_runner")
         .call()?;
 
-    let release: GitHubRelease = resp.into_json()?;
+    let body = resp.body_mut().read_to_string()?;
+    let release: GitHubRelease = serde_json::from_str(&body)?;
     let version = release.tag_name.trim_start_matches('v').to_string();
 
     // Find linux amd64 zip
@@ -119,6 +121,84 @@ fn fetch_latest_brave_release() -> Result<(String, String), Box<dyn std::error::
     }
 
     Err("No Linux amd64 zip found in release".into())
+}
+
+fn fetch_latest_ubuntu_base() -> Result<(String, String), Box<dyn std::error::Error>> {
+    // Fetch the releases directory listing
+    let mut resp = ureq::get(UBUNTU_RELEASES_URL)
+        .header("User-Agent", "void_runner")
+        .call()?;
+
+    let body = resp.body_mut().read_to_string()?;
+
+    // Parse version directories from HTML (matches patterns like "25.10/" or "24.04.3/")
+    let mut versions: Vec<String> = Vec::new();
+    for cap in body.split("href=\"").skip(1) {
+        if let Some(end) = cap.find('/') {
+            let dir = &cap[..end];
+            // Check if it looks like a version number (starts with digit, contains dots)
+            if dir.chars().next().map(|c: char| c.is_ascii_digit()).unwrap_or(false)
+               && dir.contains('.')
+               && dir.chars().all(|c: char| c.is_ascii_digit() || c == '.') {
+                versions.push(dir.to_string());
+            }
+        }
+    }
+
+    if versions.is_empty() {
+        return Err("No Ubuntu versions found".into());
+    }
+
+    // Sort versions (simple string sort works for Ubuntu versions like 24.04, 25.10)
+    versions.sort_by(|a, b| {
+        let parse_version = |s: &str| -> Vec<u32> {
+            s.split('.').filter_map(|p| p.parse().ok()).collect()
+        };
+        parse_version(a).cmp(&parse_version(b))
+    });
+
+    // Try versions from newest to oldest until we find one with a release
+    for version in versions.iter().rev() {
+        let release_url = format!("{}{}/release/", UBUNTU_RELEASES_URL, version);
+
+        if let Ok(mut resp) = ureq::get(&release_url)
+            .header("User-Agent", "void_runner")
+            .call()
+        {
+            if let Ok(body) = resp.body_mut().read_to_string() {
+                // Look for ubuntu-base-*-base-amd64.tar.gz
+                let pattern = format!("ubuntu-base-{}-base-amd64.tar.gz", version);
+                if body.contains(&pattern) {
+                    let download_url = format!("{}{}", release_url, pattern);
+                    return Ok((version.clone(), download_url));
+                }
+
+                // Also try without minor version for point releases (e.g., 24.04.3 -> 24.04)
+                let base_version: String = version.split('.').take(2).collect::<Vec<_>>().join(".");
+                let alt_pattern = format!("ubuntu-base-{}-base-amd64.tar.gz", base_version);
+                if body.contains(&alt_pattern) {
+                    let download_url = format!("{}{}", release_url, alt_pattern);
+                    return Ok((version.clone(), download_url));
+                }
+            }
+        }
+    }
+
+    Err("No Ubuntu base image found".into())
+}
+
+fn get_ubuntu_codename(rootfs: &Path) -> String {
+    // Read codename from extracted rootfs /etc/os-release
+    let os_release = rootfs.join("etc/os-release");
+    if let Ok(content) = fs::read_to_string(&os_release) {
+        for line in content.lines() {
+            if line.starts_with("VERSION_CODENAME=") {
+                return line.trim_start_matches("VERSION_CODENAME=").trim_matches('"').to_string();
+            }
+        }
+    }
+    // Fallback to noble if we can't detect
+    "noble".to_string()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -305,6 +385,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(v) = &info.brave_version {
                 println!("Brave version:  {}", v);
             }
+            if let Some(v) = &info.ubuntu_version {
+                println!("Ubuntu version: {}", v);
+            }
             if let Some(d) = &info.installed_date {
                 println!("Installed:      {}", d);
             }
@@ -331,13 +414,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn update_brave(rootfs: &Path, download_url: &str, version: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("  Downloading Brave v{}...", version);
 
-    let resp = ureq::get(download_url)
-        .set("User-Agent", "void_runner")
+    let mut resp = ureq::get(download_url)
+        .header("User-Agent", "void_runner")
         .call()?;
 
     let zip_path = rootfs.join("brave_update.zip");
     let mut out = fs::File::create(&zip_path)?;
-    let mut reader = resp.into_reader();
+    let mut reader = resp.body_mut().with_config().limit(500_000_000).reader();
     std::io::copy(&mut reader, &mut out)?;
     drop(out);
 
@@ -491,17 +574,22 @@ root.mainloop()
         }
     };
 
-    // 1. Fetch latest Brave version
-    update_progress(2, "Fetching latest Brave version...", &mut gui_stdin);
+    // 1. Fetch latest versions
+    update_progress(2, "Fetching latest versions...", &mut gui_stdin);
     let (brave_version, brave_url) = fetch_latest_brave_release()?;
+    let (ubuntu_version, ubuntu_url) = fetch_latest_ubuntu_base()?;
 
     // 2. Download Ubuntu Base
-    update_progress(5, "Downloading Ubuntu Base...", &mut gui_stdin);
+    update_progress(5, &format!("Downloading Ubuntu {} Base...", ubuntu_version), &mut gui_stdin);
 
-    let resp = ureq::get(UBUNTU_BASE_URL).call()?;
-    let len = resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok()).unwrap_or(28_000_000);
+    let mut resp = ureq::get(&ubuntu_url).call()?;
+    let len = resp.headers()
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(28_000_000);
 
-    let mut reader = resp.into_reader();
+    let mut reader = resp.body_mut().with_config().limit(500_000_000).reader();
     let mut buffer = vec![0u8; 8192];
     let mut downloaded = 0u64;
 
@@ -514,7 +602,7 @@ root.mainloop()
 
         if downloaded % 1_000_000 < 8192 {
             let pct = 5 + (downloaded * 20 / len);
-            update_progress(pct, "Downloading Ubuntu Base...", &mut gui_stdin);
+            update_progress(pct, &format!("Downloading Ubuntu {} Base...", ubuntu_version), &mut gui_stdin);
         }
     }
     drop(temp_tar);
@@ -537,37 +625,57 @@ root.mainloop()
 
     // 4. Install Dependencies
     update_progress(40, "Installing Dependencies (this takes a while)...", &mut gui_stdin);
-    
+
     // Debug: Check self_exe
     if !self_exe.exists() {
         return Err(format!("Self executable not found at: {:?}", self_exe).into());
     }
 
-    let setup_script = r#"#!/bin/bash
+    // Get Ubuntu codename from the extracted rootfs
+    let codename = get_ubuntu_codename(rootfs);
+
+    let setup_script = format!(r#"#!/bin/bash
 export DEBIAN_FRONTEND=noninteractive
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 mkdir -p /tmp /etc/apt/apt.conf.d
 echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/sandbox
 
+# Clean up any existing apt sources to avoid conflicts
+rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+
 cat > /etc/apt/sources.list << 'EOF'
-deb [trusted=yes] http://archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
-deb [trusted=yes] http://archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
-deb [trusted=yes] http://archive.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ {codename} main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ {codename}-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ {codename}-security main restricted universe multiverse
 EOF
 
+# Disable signature verification for minimal base image
+echo 'Acquire::AllowInsecureRepositories "true";' > /etc/apt/apt.conf.d/99insecure
+echo 'APT::Get::AllowUnauthenticated "true";' >> /etc/apt/apt.conf.d/99insecure
+
 apt-get update -qq
-apt-get install -y -qq --no-install-recommends \
-    ca-certificates curl unzip libnss3 libatk1.0-0 libatk-bridge2.0-0 \
-    libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
-    libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 libx11-xcb1 \
-    libx11-6 libxcb1 libdbus-1-3 libglib2.0-0 libgtk-3-0 libgl1-mesa-dri \
-    libgl1-mesa-glx mesa-vulkan-drivers libegl1 libgles2 libpulse0 \
-    libasound2-plugins fonts-liberation > /dev/null 2>&1
+
+# Install dependencies
+# Ubuntu 24.04+ uses t64 package names for time64 transition
+# Force dpkg to continue despite errors (container doesn't have full systemd)
+export DPKG_FORCE="confdef,confold,overwrite,depends"
+
+apt-get install -y --no-install-recommends \
+    ca-certificates curl unzip \
+    libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+    libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+    libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libx11-xcb1 \
+    libx11-6 libxcb1 libdbus-1-3 libglib2.0-0t64 libgtk-3-0t64 libgl1-mesa-dri \
+    mesa-vulkan-drivers libegl1 libgles2 libpulse0 \
+    libasound2-plugins fonts-liberation 2>&1 || true
+
+# Force configure any unconfigured packages
+dpkg --configure -a --force-confdef --force-confold 2>&1 || true
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
-"#;
+"#, codename = codename);
 
     let setup_path = rootfs.join("setup.sh");
     fs::write(&setup_path, setup_script).map_err(|e| format!("Failed to write setup.sh: {}", e))?;
@@ -596,12 +704,16 @@ rm -rf /var/lib/apt/lists/*
     // 5. Download Brave
     update_progress(70, &format!("Downloading Brave v{}...", brave_version), &mut gui_stdin);
 
-    let resp = ureq::get(&brave_url)
-        .set("User-Agent", "void_runner")
+    let mut resp = ureq::get(&brave_url)
+        .header("User-Agent", "void_runner")
         .call()?;
-    let len = resp.header("Content-Length").and_then(|s| s.parse::<u64>().ok()).unwrap_or(150_000_000);
+    let len = resp.headers()
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(150_000_000);
 
-    let mut reader = resp.into_reader();
+    let mut reader = resp.body_mut().with_config().limit(500_000_000).reader();
     let zip_path = rootfs.join("brave.zip");
     let mut out = fs::File::create(&zip_path)?;
 
@@ -683,6 +795,7 @@ rm -rf /var/lib/apt/lists/*
     // Save version info
     let info = InstalledInfo {
         brave_version: Some(brave_version),
+        ubuntu_version: Some(ubuntu_version),
         installed_date: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
     };
     save_installed_info(data_dir, &info);
