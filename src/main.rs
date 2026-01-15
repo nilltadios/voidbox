@@ -47,6 +47,12 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Update void_runner itself to latest version
+    SelfUpdate {
+        /// Force update even if already on latest
+        #[arg(long)]
+        force: bool,
+    },
     /// Show version and installed component info
     Info,
     /// Internal initialization (do not use manually)
@@ -83,6 +89,87 @@ fn get_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("void_runner")
+}
+
+fn get_install_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/bin/void_runner")
+}
+
+fn get_desktop_file_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("applications/void_runner.desktop")
+}
+
+fn is_installed() -> bool {
+    let install_path = get_install_path();
+    install_path.exists()
+}
+
+fn install_self() -> Result<(), Box<dyn std::error::Error>> {
+    let current_exe = std::env::current_exe()?;
+    let install_path = get_install_path();
+    let desktop_path = get_desktop_file_path();
+    let data_dir = get_data_dir();
+
+    // Create ~/.local/bin if it doesn't exist
+    if let Some(parent) = install_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Copy binary to ~/.local/bin/void_runner
+    println!("[void_runner] Installing to {}...", install_path.display());
+    fs::copy(&current_exe, &install_path)?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&install_path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Create .desktop file
+    if let Some(parent) = desktop_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Try to extract Brave icon if rootfs exists
+    let icon_dst = data_dir.join("void_runner.png");
+    if !icon_dst.exists() {
+        let brave_icon = data_dir.join("rootfs/opt/brave/product_logo_128.png");
+        if brave_icon.exists() {
+            let _ = fs::copy(&brave_icon, &icon_dst);
+        }
+    }
+
+    // Use Brave icon if available, otherwise use generic browser icon
+    let icon_value = if icon_dst.exists() {
+        icon_dst.to_string_lossy().to_string()
+    } else {
+        "web-browser".to_string()
+    };
+
+    let desktop_content = format!(
+r#"[Desktop Entry]
+Name=Void Runner
+Comment=Portable Isolated Brave Browser
+Exec=void_runner
+Icon={}
+Terminal=false
+Type=Application
+Categories=Network;WebBrowser;
+StartupWMClass=brave-browser
+"#, icon_value);
+
+    println!("[void_runner] Creating desktop launcher...");
+    fs::write(&desktop_path, desktop_content)?;
+
+    println!("[void_runner] Installation complete!");
+    println!("[void_runner] You can now run 'void_runner' from anywhere or find it in your app launcher.");
+
+    Ok(())
 }
 
 fn load_installed_info(data_dir: &Path) -> InstalledInfo {
@@ -212,8 +299,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rebuild: false
     });
 
+    // Self-install on first run (skip for internal-init command)
+    if !matches!(command, Commands::InternalInit { .. }) && !is_installed() {
+        if let Err(e) = install_self() {
+            println!("[void_runner] Warning: Self-installation failed: {}", e);
+            println!("[void_runner] Continuing without installation...");
+        }
+    }
+
     match command {
         Commands::Run { url, cmd, rebuild } => {
+            // Check for void_runner self-updates first
+            print!("[void_runner] Checking for self-updates... ");
+            match get_latest_self_version() {
+                Ok(latest) => {
+                    // Check if latest is actually newer using semver
+                    let current = semver::Version::parse(VERSION).ok();
+                    let latest_parsed = semver::Version::parse(&latest).ok();
+                    let is_newer = match (&current, &latest_parsed) {
+                        (Some(c), Some(l)) => l > c,
+                        _ => latest != VERSION,
+                    };
+
+                    if is_newer {
+                        println!("v{} available!", latest);
+                        match check_self_update(false) {
+                            Ok(true) => println!("[void_runner] Please restart void_runner to use the new version."),
+                            Ok(false) => {}
+                            Err(e) => println!("[void_runner] Self-update failed: {}", e),
+                        }
+                    } else {
+                        println!("up to date.");
+                    }
+                }
+                Err(e) => println!("failed ({})", e),
+            }
+
             let rootfs = data_dir.join("rootfs");
 
             if rebuild && rootfs.exists() {
@@ -371,6 +492,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[void_runner] Update complete! Brave v{} installed.", latest_version);
         }
 
+        Commands::SelfUpdate { force } => {
+            println!("[void_runner] Checking for void_runner updates...");
+            println!("  Installed: v{}", VERSION);
+
+            match get_latest_self_version() {
+                Ok(latest) => {
+                    println!("  Latest:    v{}", latest);
+
+                    if !force && latest == VERSION {
+                        println!("[void_runner] Already running latest version.");
+                        return Ok(());
+                    }
+
+                    match check_self_update(force) {
+                        Ok(true) => println!("[void_runner] Self-update complete! Please restart void_runner."),
+                        Ok(false) => println!("[void_runner] Already up to date."),
+                        Err(e) => println!("[void_runner] Self-update failed: {}", e),
+                    }
+                }
+                Err(e) => println!("[void_runner] Failed to check for updates: {}", e),
+            }
+        }
+
         Commands::Info => {
             println!("void_runner v{}", VERSION);
             println!("Portable Isolated Brave Browser");
@@ -394,10 +538,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Check for updates
             println!();
-            print!("Checking for updates... ");
+            print!("Checking for Brave updates... ");
             match fetch_latest_brave_release() {
                 Ok((latest, _)) => {
                     if info.brave_version.as_deref() == Some(&latest) {
+                        println!("Up to date (v{})", latest);
+                    } else {
+                        println!("Update available: v{}", latest);
+                    }
+                }
+                Err(e) => println!("Failed ({})", e),
+            }
+
+            print!("Checking for void_runner updates... ");
+            match get_latest_self_version() {
+                Ok(latest) => {
+                    if latest == VERSION {
                         println!("Up to date (v{})", latest);
                     } else {
                         println!("Update available: v{}", latest);
@@ -490,6 +646,57 @@ fn update_brave(rootfs: &Path, download_url: &str, version: &str) -> Result<(), 
     std::os::unix::fs::symlink(container_path, link_path)?;
 
     Ok(())
+}
+
+fn check_self_update(force: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("nilltadios")
+        .repo_name("brave_box")
+        .bin_name("void_runner")
+        .current_version(VERSION)
+        .build()?;
+
+    let latest = status.get_latest_release()?;
+    let latest_version = latest.version.trim_start_matches('v');
+
+    // Parse versions for proper comparison
+    let current = semver::Version::parse(VERSION).ok();
+    let latest_parsed = semver::Version::parse(latest_version).ok();
+
+    let is_newer = match (&current, &latest_parsed) {
+        (Some(c), Some(l)) => l > c,
+        _ => latest_version != VERSION, // Fallback to string comparison
+    };
+
+    if !force && !is_newer {
+        return Ok(false);
+    }
+
+    println!("[void_runner] Self-update available: v{} -> v{}", VERSION, latest_version);
+    println!("[void_runner] Updating void_runner...");
+
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("nilltadios")
+        .repo_name("brave_box")
+        .bin_name("void_runner")
+        .current_version(VERSION)
+        .build()?
+        .update()?;
+
+    println!("[void_runner] Updated to v{}", status.version());
+    Ok(true)
+}
+
+fn get_latest_self_version() -> Result<String, Box<dyn std::error::Error>> {
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("nilltadios")
+        .repo_name("brave_box")
+        .bin_name("void_runner")
+        .current_version(VERSION)
+        .build()?;
+
+    let latest = status.get_latest_release()?;
+    Ok(latest.version.trim_start_matches('v').to_string())
 }
 
 fn build_environment(data_dir: &Path, rootfs: &Path, self_exe: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -837,6 +1044,22 @@ echo "Setup complete!"
         installed_date: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
     };
     save_installed_info(data_dir, &info);
+
+    // Extract Brave icon for desktop launcher
+    let icon_src = target_dir.join("product_logo_128.png");
+    if icon_src.exists() {
+        let icon_dst = data_dir.join("void_runner.png");
+        let _ = fs::copy(&icon_src, &icon_dst);
+
+        // Update .desktop file with the icon if it exists
+        let desktop_path = get_desktop_file_path();
+        if desktop_path.exists() {
+            if let Ok(content) = fs::read_to_string(&desktop_path) {
+                let updated = content.replace("Icon=web-browser", &format!("Icon={}", icon_dst.display()));
+                let _ = fs::write(&desktop_path, updated);
+            }
+        }
+    }
 
     update_progress(100, "Done! Launching...", &mut gui_stdin);
 
