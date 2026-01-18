@@ -1,0 +1,58 @@
+# Discord manifest for Voidbox
+# Install with: voidbox install discord.toml
+
+[app]
+name = "discord"
+display_name = "Discord"
+description = "Voice, video & text chat"
+license = "Proprietary"
+
+[source]
+type = "direct"
+url = "https://discord.com/api/download?platform=linux&format=tar.gz"
+version_url = "https://discord.com/api/updates/stable?platform=linux"
+
+[runtime]
+base = "ubuntu:24.04"
+arch = ["x86_64"]
+
+[dependencies]
+packages = [
+    "libgtk-3-0t64",
+    "libasound2t64",
+    "libnotify4",
+    "libnss3",
+    "libxss1",
+    "libxtst6",
+    "xdg-utils",
+    "libsecret-1-0",
+    "libappindicator3-1",
+    "libgbm1",
+    "libdrm2",
+]
+
+[binary]
+name = "Discord"
+path = "Discord"
+install_dir = "discord"
+args = []
+
+[desktop]
+categories = ["Network", "InstantMessaging"]
+wm_class = "discord"
+icon = "discord.png"
+mime_types = ["x-scheme-handler/discord"]
+keywords = ["voice", "chat", "gaming", "communication"]
+
+[permissions]
+network = true
+audio = true
+microphone = true
+gpu = true
+camera = false
+home = true
+downloads = true
+removable_media = false
+dev_mode = false
+fonts = true
+themes = true

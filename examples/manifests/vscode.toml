@@ -1,0 +1,56 @@
+# Visual Studio Code manifest for Voidbox
+# Install with: voidbox install vscode.toml
+
+[app]
+name = "vscode"
+display_name = "Visual Studio Code"
+description = "Code editing. Redefined."
+license = "MIT"
+
+[source]
+type = "direct"
+url = "https://code.visualstudio.com/sha/download?build=stable&os=linux-x64"
+
+[runtime]
+base = "ubuntu:24.04"
+arch = ["x86_64"]
+
+[dependencies]
+packages = [
+    "libgtk-3-0t64",
+    "libnotify4",
+    "libnss3",
+    "libxss1",
+    "libxtst6",
+    "xdg-utils",
+    "libsecret-1-0",
+    "libxkbfile1",
+    "libgbm1",
+    "libdrm2",
+    "git",
+]
+
+[binary]
+name = "code"
+install_dir = "vscode"
+args = ["--no-sandbox"]
+
+[desktop]
+categories = ["Development", "IDE", "TextEditor"]
+wm_class = "Code"
+icon = "resources/app/resources/linux/code.png"
+mime_types = ["text/plain", "application/x-code-workspace"]
+keywords = ["code", "editor", "development", "programming"]
+
+[permissions]
+network = true
+audio = false
+microphone = false
+gpu = true
+camera = false
+home = true
+downloads = true
+removable_media = false
+dev_mode = true   # VSCode needs access to host tools
+fonts = true
+themes = true
