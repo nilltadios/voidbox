@@ -78,8 +78,9 @@ network = true
 audio = true
 microphone = true
 gpu = true
-camera = false
+camera = true
 home = true
+
 downloads = true
 removable_media = false
 dev_mode = false

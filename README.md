@@ -138,8 +138,9 @@ All permissions default to **open** (enabled). Users can restrict permissions:
 | audio | true | Audio output |
 | microphone | true | Audio input |
 | gpu | true | GPU acceleration |
-| camera | false | Webcam access |
+| camera | true | Webcam access |
 | home | true | Home folder access |
+
 | downloads | true | Downloads folder |
 | fonts | true | Host fonts |
 | themes | true | Host GTK/Qt themes |
