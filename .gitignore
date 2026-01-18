@@ -3,4 +3,10 @@
 .DS_Store
 void_runner
 AGENTS.md
+*.aux
+*.log
+*.out
+*.toc
+*.bak*
+
 
