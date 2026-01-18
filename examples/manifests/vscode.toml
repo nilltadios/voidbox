@@ -10,6 +10,8 @@ license = "MIT"
 [source]
 type = "direct"
 url = "https://code.visualstudio.com/sha/download?build=stable&os=linux-x64"
+archive_type = "tar.gz"
+
 
 [runtime]
 base = "ubuntu:24.04"
@@ -27,13 +29,16 @@ packages = [
     "libxkbfile1",
     "libgbm1",
     "libdrm2",
+    "libasound2t64",  # ALSA audio (required by Electron even if audio disabled)
     "git",
 ]
 
 [binary]
 name = "code"
 install_dir = "vscode"
-args = ["--no-sandbox"]
+args = ["--no-sandbox", "--disable-dev-shm-usage", "--user-data-dir=/tmp/.vscode"]
+path = "bin/code"
+
 
 [desktop]
 categories = ["Development", "IDE", "TextEditor"]

@@ -53,7 +53,10 @@ pub enum SourceConfig {
         url: String,
         #[serde(default)]
         version_url: Option<String>,
+        #[serde(default)]
+        archive_type: Option<String>,
     },
+
     /// Local file path (for testing)
     Local { path: PathBuf },
 }

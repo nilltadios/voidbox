@@ -376,7 +376,7 @@ fn install_app_binary(
     rootfs: &Path,
     manifest: &AppManifest,
 ) -> Result<Option<String>, InstallError> {
-    let (version, download_url) = match &manifest.source {
+    let (version, download_url, override_ext) = match &manifest.source {
         SourceConfig::Github {
             owner,
             repo,
@@ -384,14 +384,28 @@ fn install_app_binary(
             asset_arch,
             asset_extension,
             ..
-        } => fetch_github_release(
-            owner,
-            repo,
-            asset_os,
-            asset_arch,
-            asset_extension.as_deref(),
-        )?,
-        SourceConfig::Direct { url, .. } => ("latest".to_string(), url.clone()),
+        } => (
+            fetch_github_release(
+                owner,
+                repo,
+                asset_os,
+                asset_arch,
+                asset_extension.as_deref(),
+            )?
+            .0,
+            fetch_github_release(
+                owner,
+                repo,
+                asset_os,
+                asset_arch,
+                asset_extension.as_deref(),
+            )?
+            .1,
+            None,
+        ),
+        SourceConfig::Direct {
+            url, archive_type, ..
+        } => ("latest".to_string(), url.clone(), archive_type.clone()),
         SourceConfig::Local { path } => {
             // Just copy from local path
             let install_dir = manifest
@@ -429,7 +443,17 @@ fn install_app_binary(
         .install_dir
         .as_deref()
         .unwrap_or(&manifest.app.name);
-    let extension = get_extension_from_url(&download_url);
+
+    let extension = if let Some(ext) = override_ext {
+        if ext.starts_with('.') {
+            ext
+        } else {
+            format!(".{}", ext)
+        }
+    } else {
+        get_extension_from_url(&download_url)
+    };
+
     let archive_path = rootfs.join(format!("{}_download{}", install_dir, extension));
 
     download_file(&download_url, &archive_path, true)?;
@@ -575,12 +599,28 @@ fn create_binary_symlink(rootfs: &Path, manifest: &AppManifest) -> Result<(), In
     let binary_name = &manifest.binary.name;
     let mut binary_path = None;
 
-    for entry in WalkDir::new(&target_dir).max_depth(3) {
-        if let Ok(entry) = entry {
-            if entry.file_name().to_string_lossy() == binary_name.as_str() && entry.path().is_file()
-            {
-                binary_path = Some(entry.path().to_path_buf());
-                break;
+    // Priority 1: Check manifest path (suffix match for flexibility)
+    if let Some(explicit_path) = &manifest.binary.path {
+        for entry in WalkDir::new(&target_dir).max_depth(3) {
+            if let Ok(entry) = entry {
+                if entry.path().ends_with(explicit_path) && entry.path().is_file() {
+                    binary_path = Some(entry.path().to_path_buf());
+                    break;
+                }
+            }
+        }
+    }
+
+    // Priority 2: Name match (existing logic)
+    if binary_path.is_none() {
+        for entry in WalkDir::new(&target_dir).max_depth(3) {
+            if let Ok(entry) = entry {
+                if entry.file_name().to_string_lossy() == binary_name.as_str()
+                    && entry.path().is_file()
+                {
+                    binary_path = Some(entry.path().to_path_buf());
+                    break;
+                }
             }
         }
     }

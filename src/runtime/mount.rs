@@ -298,5 +298,17 @@ pub fn setup_container_env() {
             std::env::set_var("XDG_RUNTIME_DIR", format!("/{}", relative));
             std::env::set_var("PULSE_SERVER", format!("unix:/{}/pulse/native", relative));
         }
+
+        // X11/Wayland display - DISPLAY is inherited from parent, just ensure it's set
+        // The /tmp/.X11-unix socket is already mounted via /tmp bind mount
+        if std::env::var("DISPLAY").is_err() {
+            // Default to :0 if not set
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        // Wayland socket (if using Wayland)
+        if let Ok(wayland_display) = std::env::var("WAYLAND_DISPLAY") {
+            std::env::set_var("WAYLAND_DISPLAY", wayland_display);
+        }
     }
 }
