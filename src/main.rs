@@ -1,3 +1,5 @@
+mod app;
+
 use clap::{Parser, Subcommand};
 use flate2::read::GzDecoder;
 use nix::mount::{mount, umount2, MsFlags, MntFlags};
@@ -13,13 +15,12 @@ use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const BRAVE_RELEASES_API: &str = "https://api.github.com/repos/brave/brave-browser/releases/latest";
 const UBUNTU_RELEASES_URL: &str = "https://cdimage.ubuntu.com/ubuntu-base/releases/";
 
 #[derive(Parser)]
-#[command(name = "void_runner")]
+#[command(name = app::APP_NAME)]
 #[command(version = VERSION)]
-#[command(about = "Portable Isolated Brave Browser - No container runtime needed", long_about = None)]
+#[command(about = app::APP_DESCRIPTION, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -27,13 +28,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Launch Brave or a command inside the box
+    /// Launch the app or a command inside the container
     Run {
-        /// URL to open (if running default brave)
+        /// URL to open (if running default app)
         #[arg(long)]
         url: Option<String>,
 
-        /// Command to run (overrides default brave)
+        /// Command to run (overrides default app)
         #[arg(trailing_var_arg = true)]
         cmd: Vec<String>,
 
@@ -41,7 +42,7 @@ enum Commands {
         #[arg(long)]
         rebuild: bool,
     },
-    /// Update Brave browser to latest version
+    /// Update target app to latest version
     Update {
         /// Force update even if already on latest
         #[arg(long)]
@@ -86,7 +87,8 @@ struct GitHubAsset {
 
 #[derive(Deserialize, serde::Serialize, Default)]
 struct InstalledInfo {
-    brave_version: Option<String>,
+    #[serde(alias = "brave_version")]  // Backwards compatibility with old installs
+    app_version: Option<String>,
     ubuntu_version: Option<String>,
     installed_date: Option<String>,
 }
@@ -94,19 +96,19 @@ struct InstalledInfo {
 fn get_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("void_runner")
+        .join(app::APP_NAME)
 }
 
 fn get_install_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/bin/void_runner")
+        .join(format!(".local/bin/{}", app::APP_NAME))
 }
 
 fn get_desktop_file_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("applications/void_runner.desktop")
+        .join(format!("applications/{}.desktop", app::APP_NAME))
 }
 
 fn is_installed() -> bool {
@@ -125,8 +127,8 @@ fn install_self() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(parent)?;
     }
 
-    // Copy binary to ~/.local/bin/void_runner
-    println!("[void_runner] Installing to {}...", install_path.display());
+    // Copy binary to install path
+    println!("[{}] Installing to {}...", app::APP_NAME, install_path.display());
     fs::copy(&current_exe, &install_path)?;
 
     // Make executable
@@ -141,39 +143,46 @@ fn install_self() -> Result<(), Box<dyn std::error::Error>> {
         fs::create_dir_all(parent)?;
     }
 
-    // Try to extract Brave icon if rootfs exists
-    let icon_dst = data_dir.join("void_runner.png");
+    // Try to extract app icon if rootfs exists
+    let icon_dst = data_dir.join(format!("{}.png", app::APP_NAME));
     if !icon_dst.exists() {
-        let brave_icon = data_dir.join("rootfs/opt/brave/product_logo_128.png");
-        if brave_icon.exists() {
-            let _ = fs::copy(&brave_icon, &icon_dst);
+        let app_icon = data_dir.join(format!("rootfs/opt/{}/{}", app::TARGET_INSTALL_DIR, app::TARGET_ICON_FILENAME));
+        if app_icon.exists() {
+            let _ = fs::copy(&app_icon, &icon_dst);
         }
     }
 
-    // Use Brave icon if available, otherwise use generic browser icon
+    // Use app icon if available, otherwise use fallback icon
     let icon_value = if icon_dst.exists() {
         icon_dst.to_string_lossy().to_string()
     } else {
-        "web-browser".to_string()
+        app::DESKTOP_FALLBACK_ICON.to_string()
     };
 
     let desktop_content = format!(
 r#"[Desktop Entry]
-Name=Void Runner
-Comment=Portable Isolated Brave Browser
-Exec=void_runner
+Name={}
+Comment={}
+Exec={}
 Icon={}
 Terminal=false
 Type=Application
-Categories=Network;WebBrowser;
-StartupWMClass=brave-browser
-"#, icon_value);
+Categories={}
+StartupWMClass={}
+"#,
+        app::APP_DISPLAY_NAME,
+        app::APP_DESCRIPTION,
+        app::APP_NAME,
+        icon_value,
+        app::DESKTOP_CATEGORIES,
+        app::DESKTOP_WM_CLASS
+    );
 
-    println!("[void_runner] Creating desktop launcher...");
+    println!("[{}] Creating desktop launcher...", app::APP_NAME);
     fs::write(&desktop_path, desktop_content)?;
 
-    println!("[void_runner] Installation complete!");
-    println!("[void_runner] You can now run 'void_runner' from anywhere or find it in your app launcher.");
+    println!("[{}] Installation complete!", app::APP_NAME);
+    println!("[{}] You can now run '{}' from anywhere or find it in your app launcher.", app::APP_NAME, app::APP_NAME);
 
     Ok(())
 }
@@ -183,7 +192,7 @@ fn uninstall_self(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     let desktop_path = get_desktop_file_path();
     let data_dir = get_data_dir();
 
-    println!("[void_runner] Uninstalling...");
+    println!("[{}] Uninstalling...", app::APP_NAME);
 
     // Remove binary
     if install_path.exists() {
@@ -198,7 +207,7 @@ fn uninstall_self(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Remove icon
-    let icon_path = data_dir.join("void_runner.png");
+    let icon_path = data_dir.join(format!("{}.png", app::APP_NAME));
     if icon_path.exists() {
         fs::remove_file(&icon_path)?;
         println!("  Removed {}", icon_path.display());
@@ -223,7 +232,7 @@ fn uninstall_self(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("[void_runner] Uninstall complete!");
+    println!("[{}] Uninstall complete!", app::APP_NAME);
 
     Ok(())
 }
@@ -247,29 +256,39 @@ fn save_installed_info(data_dir: &Path, info: &InstalledInfo) {
     }
 }
 
-fn fetch_latest_brave_release() -> Result<(String, String), Box<dyn std::error::Error>> {
-    let mut resp = ureq::get(BRAVE_RELEASES_API)
-        .header("User-Agent", "void_runner")
+fn fetch_latest_target_release() -> Result<(String, String), Box<dyn std::error::Error>> {
+    let api_url = app::RELEASES_API.ok_or("No releases API configured")?;
+
+    let mut resp = ureq::get(api_url)
+        .header("User-Agent", app::APP_NAME)
         .call()?;
 
     let body = resp.body_mut().read_to_string()?;
     let release: GitHubRelease = serde_json::from_str(&body)?;
     let version = release.tag_name.trim_start_matches('v').to_string();
 
-    // Find linux amd64 zip
+    // Find matching asset based on app config
     for asset in release.assets {
-        if asset.name.contains("linux") && asset.name.contains("amd64") && asset.name.ends_with(".zip") {
+        if asset.name.contains(app::ASSET_OS_PATTERN)
+            && asset.name.contains(app::ASSET_ARCH_PATTERN)
+            && asset.name.ends_with(app::ASSET_EXTENSION)
+        {
             return Ok((version, asset.browser_download_url));
         }
     }
 
-    Err("No Linux amd64 zip found in release".into())
+    Err(format!(
+        "No {} {} {} found in release",
+        app::ASSET_OS_PATTERN,
+        app::ASSET_ARCH_PATTERN,
+        app::ASSET_EXTENSION
+    ).into())
 }
 
 fn fetch_latest_ubuntu_base() -> Result<(String, String), Box<dyn std::error::Error>> {
     // Fetch the releases directory listing
     let mut resp = ureq::get(UBUNTU_RELEASES_URL)
-        .header("User-Agent", "void_runner")
+        .header("User-Agent", app::APP_NAME)
         .call()?;
 
     let body = resp.body_mut().read_to_string()?;
@@ -305,7 +324,7 @@ fn fetch_latest_ubuntu_base() -> Result<(String, String), Box<dyn std::error::Er
         let release_url = format!("{}{}/release/", UBUNTU_RELEASES_URL, version);
 
         if let Ok(mut resp) = ureq::get(&release_url)
-            .header("User-Agent", "void_runner")
+            .header("User-Agent", app::APP_NAME)
             .call()
         {
             if let Ok(body) = resp.body_mut().read_to_string() {
@@ -358,15 +377,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Self-install on first run (skip for internal-init command)
     if !matches!(command, Commands::InternalInit { .. }) && !is_installed() {
         if let Err(e) = install_self() {
-            println!("[void_runner] Warning: Self-installation failed: {}", e);
-            println!("[void_runner] Continuing without installation...");
+            println!("[{}] Warning: Self-installation failed: {}", app::APP_NAME, e);
+            println!("[{}] Continuing without installation...", app::APP_NAME);
         }
     }
 
     match command {
         Commands::Run { url, cmd, rebuild } => {
-            // Check for void_runner self-updates first
-            print!("[void_runner] Checking for self-updates... ");
+            // Check for self-updates first
+            print!("[{}] Checking for self-updates... ", app::APP_NAME);
             match get_latest_self_version() {
                 Ok(latest) => {
                     // Check if latest is actually newer using semver
@@ -380,9 +399,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if is_newer {
                         println!("v{} available!", latest);
                         match check_self_update(false) {
-                            Ok(true) => println!("[void_runner] Please restart void_runner to use the new version."),
+                            Ok(true) => println!("[{}] Please restart to use the new version.", app::APP_NAME),
                             Ok(false) => {}
-                            Err(e) => println!("[void_runner] Self-update failed: {}", e),
+                            Err(e) => println!("[{}] Self-update failed: {}", app::APP_NAME, e),
                         }
                     } else {
                         println!("up to date.");
@@ -394,26 +413,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rootfs = data_dir.join("rootfs");
 
             if rebuild && rootfs.exists() {
-                println!("[void_runner] Rebuild requested. Removing old rootfs...");
+                println!("[{}] Rebuild requested. Removing old rootfs...", app::APP_NAME);
                 fs::remove_dir_all(&rootfs)?;
             }
 
-            // Check if installation is complete (brave symlink exists)
-            let brave_link = rootfs.join("usr/bin/brave");
-            // Only enforce build check if we are running default brave
+            // Check if installation is complete (target app symlink exists)
+            let target_link = rootfs.join(format!("usr/bin/{}", app::TARGET_BINARY_NAME));
+            // Only enforce build check if we are running default app
             let is_default_run = cmd.is_empty();
-            
+
             let needs_build = if is_default_run {
                 // Check if rootfs exists and the symlink exists (do NOT follow it, as it points to /opt inside container)
-                !rootfs.exists() || fs::symlink_metadata(&brave_link).is_err()
+                !rootfs.exists() || fs::symlink_metadata(&target_link).is_err()
             } else {
                 !rootfs.exists()
             };
 
             if needs_build && rootfs.exists() && is_default_run {
                 // Incomplete install - remove and rebuild
-                // Only do this if we expected to run Brave but it's missing
-                println!("[void_runner] Incomplete installation detected (missing {:?}). Rebuilding...", brave_link);
+                println!("[{}] Incomplete installation detected (missing {:?}). Rebuilding...", app::APP_NAME, target_link);
                 fs::remove_dir_all(&rootfs)?;
             }
 
@@ -425,7 +443,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // ... (existing terminal spawning code) ...
                 }
 
-                println!("[void_runner] Building isolated environment...");
+                println!("[{}] Building isolated environment...", app::APP_NAME);
                 build_environment(&data_dir, &rootfs, &std::env::current_exe()?)?;
             } else {
                 // Check for updates on launch (if not building)
@@ -435,19 +453,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Only check if it's been more than 24 hours or if we just want to be safe
                         // For responsiveness, we'll spawn a background thread/process or just check quickly
                         // Here we do a blocking check but print nicely.
-                        println!("[void_runner] Checking for updates...");
-                        if let Ok((latest, url)) = fetch_latest_brave_release() {
-                            if installed.brave_version.as_deref() != Some(&latest) {
-                                println!("[void_runner] Update available: v{} -> v{}", installed.brave_version.as_deref().unwrap_or("?"), latest);
-                                println!("[void_runner] Auto-updating...");
-                                if let Err(e) = update_brave(&rootfs, &url, &latest) {
-                                    println!("[void_runner] Update failed: {}", e);
+                        println!("[{}] Checking for updates...", app::APP_NAME);
+                        if let Ok((latest, url)) = fetch_latest_target_release() {
+                            if installed.app_version.as_deref() != Some(&latest) {
+                                println!("[{}] Update available: v{} -> v{}", app::APP_NAME, installed.app_version.as_deref().unwrap_or("?"), latest);
+                                println!("[{}] Auto-updating...", app::APP_NAME);
+                                if let Err(e) = update_target_app(&rootfs, &url, &latest) {
+                                    println!("[{}] Update failed: {}", app::APP_NAME, e);
                                 } else {
                                     let mut new_info = installed;
-                                    new_info.brave_version = Some(latest.clone());
+                                    new_info.app_version = Some(latest.clone());
                                     new_info.installed_date = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
                                     save_installed_info(&data_dir, &new_info);
-                                    println!("[void_runner] Updated to v{}", latest);
+                                    println!("[{}] Updated to v{}", app::APP_NAME, latest);
                                 }
                             }
                         }
@@ -457,15 +475,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Determine command to run
             let (run_cmd, run_args) = if cmd.is_empty() {
-                let mut args = vec![
-                    "--no-sandbox".to_string(),
-                    "--disable-dev-shm-usage".to_string(),
-                    "--test-type".to_string(),
-                ];
+                let mut args: Vec<String> = app::DEFAULT_LAUNCH_ARGS.iter().map(|s| s.to_string()).collect();
                 if let Some(u) = url {
                     args.push(u);
                 }
-                ("/usr/bin/brave".to_string(), args)
+                (format!("/usr/bin/{}", app::TARGET_BINARY_NAME), args)
             } else {
                 (cmd[0].clone(), cmd[1..].to_vec())
             };
@@ -513,43 +527,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Update { force } => {
-            println!("[void_runner] Checking for Brave updates...");
+            println!("[{}] Checking for {} updates...", app::APP_NAME, app::TARGET_APP_NAME);
 
             let info = load_installed_info(&data_dir);
-            let (latest_version, download_url) = fetch_latest_brave_release()?;
+            let (latest_version, download_url) = fetch_latest_target_release()?;
 
-            println!("  Installed: {}", info.brave_version.as_deref().unwrap_or("unknown"));
+            println!("  Installed: {}", info.app_version.as_deref().unwrap_or("unknown"));
             println!("  Latest:    {}", latest_version);
 
-            let needs_update = force || info.brave_version.as_deref() != Some(&latest_version);
+            let needs_update = force || info.app_version.as_deref() != Some(&latest_version);
 
             if !needs_update {
-                println!("[void_runner] Already running latest version.");
+                println!("[{}] Already running latest version.", app::APP_NAME);
                 return Ok(());
             }
 
-            println!("[void_runner] Updating Brave to v{}...", latest_version);
+            println!("[{}] Updating {} to v{}...", app::APP_NAME, app::TARGET_APP_NAME, latest_version);
 
             let rootfs = data_dir.join("rootfs");
             if !rootfs.exists() {
-                println!("[void_runner] No installation found. Run 'void_runner' first to install.");
+                println!("[{}] No installation found. Run '{}' first to install.", app::APP_NAME, app::APP_NAME);
                 return Ok(());
             }
 
-            // Download and install new Brave
-            update_brave(&rootfs, &download_url, &latest_version)?;
+            // Download and install new target app
+            update_target_app(&rootfs, &download_url, &latest_version)?;
 
             // Save new version info
             let mut new_info = info;
-            new_info.brave_version = Some(latest_version.clone());
+            new_info.app_version = Some(latest_version.clone());
             new_info.installed_date = Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
             save_installed_info(&data_dir, &new_info);
 
-            println!("[void_runner] Update complete! Brave v{} installed.", latest_version);
+            println!("[{}] Update complete! {} v{} installed.", app::APP_NAME, app::TARGET_APP_NAME, latest_version);
         }
 
         Commands::SelfUpdate { force } => {
-            println!("[void_runner] Checking for void_runner updates...");
+            println!("[{}] Checking for {} updates...", app::APP_NAME, app::APP_NAME);
             println!("  Installed: v{}", VERSION);
 
             match get_latest_self_version() {
@@ -557,25 +571,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  Latest:    v{}", latest);
 
                     if !force && latest == VERSION {
-                        println!("[void_runner] Already running latest version.");
+                        println!("[{}] Already running latest version.", app::APP_NAME);
                         return Ok(());
                     }
 
                     match check_self_update(force) {
-                        Ok(true) => println!("[void_runner] Self-update complete! Please restart void_runner."),
-                        Ok(false) => println!("[void_runner] Already up to date."),
-                        Err(e) => println!("[void_runner] Self-update failed: {}", e),
+                        Ok(true) => println!("[{}] Self-update complete! Please restart {}.", app::APP_NAME, app::APP_NAME),
+                        Ok(false) => println!("[{}] Already up to date.", app::APP_NAME),
+                        Err(e) => println!("[{}] Self-update failed: {}", app::APP_NAME, e),
                     }
                 }
-                Err(e) => println!("[void_runner] Failed to check for updates: {}", e),
+                Err(e) => println!("[{}] Failed to check for updates: {}", app::APP_NAME, e),
             }
         }
 
         Commands::Uninstall { purge } => {
             if purge {
-                println!("[void_runner] This will remove void_runner and ALL browser data.");
+                println!("[{}] This will remove {} and ALL app data.", app::APP_NAME, app::APP_NAME);
             } else {
-                println!("[void_runner] This will remove void_runner but keep browser data.");
+                println!("[{}] This will remove {} but keep app data.", app::APP_NAME, app::APP_NAME);
             }
             print!("Continue? [y/N] ");
             std::io::Write::flush(&mut std::io::stdout())?;
@@ -586,13 +600,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if input.trim().to_lowercase() == "y" {
                 uninstall_self(purge)?;
             } else {
-                println!("[void_runner] Uninstall cancelled.");
+                println!("[{}] Uninstall cancelled.", app::APP_NAME);
             }
         }
 
         Commands::Info => {
-            println!("void_runner v{}", VERSION);
-            println!("Portable Isolated Brave Browser");
+            println!("{} v{}", app::APP_NAME, VERSION);
+            println!("{}", app::APP_DESCRIPTION);
             println!();
 
             let info = load_installed_info(&data_dir);
@@ -601,8 +615,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Data directory: {}", data_dir.display());
             println!("Rootfs exists:  {}", rootfs.exists());
 
-            if let Some(v) = &info.brave_version {
-                println!("Brave version:  {}", v);
+            if let Some(v) = &info.app_version {
+                println!("{} version: {}", app::TARGET_APP_NAME, v);
             }
             if let Some(v) = &info.ubuntu_version {
                 println!("Ubuntu version: {}", v);
@@ -613,10 +627,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Check for updates
             println!();
-            print!("Checking for Brave updates... ");
-            match fetch_latest_brave_release() {
+            print!("Checking for {} updates... ", app::TARGET_APP_NAME);
+            match fetch_latest_target_release() {
                 Ok((latest, _)) => {
-                    if info.brave_version.as_deref() == Some(&latest) {
+                    if info.app_version.as_deref() == Some(&latest) {
                         println!("Up to date (v{})", latest);
                     } else {
                         println!("Update available: v{}", latest);
@@ -625,7 +639,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => println!("Failed ({})", e),
             }
 
-            print!("Checking for void_runner updates... ");
+            print!("Checking for {} updates... ", app::APP_NAME);
             match get_latest_self_version() {
                 Ok(latest) => {
                     if latest == VERSION {
@@ -642,78 +656,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn update_brave(rootfs: &Path, download_url: &str, version: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("  Downloading Brave v{}...", version);
+fn update_target_app(rootfs: &Path, download_url: &str, version: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("  Downloading {} v{}...", app::TARGET_APP_NAME, version);
 
     let mut resp = ureq::get(download_url)
-        .header("User-Agent", "void_runner")
+        .header("User-Agent", app::APP_NAME)
         .call()?;
 
-    let zip_path = rootfs.join("brave_update.zip");
-    let mut out = fs::File::create(&zip_path)?;
+    let archive_path = rootfs.join(format!("{}_update{}", app::TARGET_INSTALL_DIR, app::ASSET_EXTENSION));
+    let mut out = fs::File::create(&archive_path)?;
     let mut reader = resp.body_mut().with_config().limit(500_000_000).reader();
     std::io::copy(&mut reader, &mut out)?;
     drop(out);
 
     println!("  Extracting...");
 
-    // Remove old brave
-    let brave_dir = rootfs.join("opt/brave");
-    if brave_dir.exists() {
-        fs::remove_dir_all(&brave_dir)?;
+    // Remove old app
+    let target_dir = rootfs.join(format!("opt/{}", app::TARGET_INSTALL_DIR));
+    if target_dir.exists() {
+        fs::remove_dir_all(&target_dir)?;
     }
-    fs::create_dir_all(&brave_dir)?;
+    fs::create_dir_all(&target_dir)?;
 
-    // Extract new
-    let file = fs::File::open(&zip_path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
+    // Extract based on archive type
+    match app::TARGET_ARCHIVE_TYPE {
+        app::ArchiveType::Zip => {
+            let file = fs::File::open(&archive_path)?;
+            let mut archive = zip::ZipArchive::new(file)?;
 
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => brave_dir.join(path),
-            None => continue,
-        };
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i)?;
+                let outpath = match file.enclosed_name() {
+                    Some(path) => target_dir.join(path),
+                    None => continue,
+                };
 
-        if file.name().ends_with('/') {
-            fs::create_dir_all(&outpath)?;
-        } else {
-            if let Some(p) = outpath.parent() {
-                if !p.exists() { fs::create_dir_all(p)?; }
+                if file.name().ends_with('/') {
+                    fs::create_dir_all(&outpath)?;
+                } else {
+                    if let Some(p) = outpath.parent() {
+                        if !p.exists() { fs::create_dir_all(p)?; }
+                    }
+                    let mut outfile = fs::File::create(&outpath)?;
+                    std::io::copy(&mut file, &mut outfile)?;
+                }
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(mode) = file.unix_mode() {
+                        fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
+                    }
+                }
             }
-            let mut outfile = fs::File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)?;
         }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = file.unix_mode() {
-                fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
-            }
+        app::ArchiveType::TarGz => {
+            let file = fs::File::open(&archive_path)?;
+            let decoder = GzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(&target_dir)?;
+        }
+        app::ArchiveType::TarXz => {
+            // For .tar.xz, we'd need xz2 crate - for now just error
+            return Err("TarXz archive type not yet supported".into());
         }
     }
 
-    fs::remove_file(zip_path)?;
+    fs::remove_file(archive_path)?;
 
     // Update symlink
     let mut binary_path = PathBuf::new();
-    for entry in WalkDir::new(&brave_dir) {
+    for entry in WalkDir::new(&target_dir) {
         let entry = entry?;
-        if entry.file_name() == "brave" && entry.path().is_file() {
+        if entry.file_name() == app::TARGET_BINARY_NAME && entry.path().is_file() {
             binary_path = entry.path().to_path_buf();
             break;
         }
     }
 
     if binary_path.as_os_str().is_empty() {
-        return Err("Brave binary not found".into());
+        return Err(format!("{} binary not found", app::TARGET_APP_NAME).into());
     }
 
     let relative_path = binary_path.strip_prefix(rootfs)?;
     let container_path = Path::new("/").join(relative_path);
 
-    let link_path = rootfs.join("usr/bin/brave");
+    let link_path = rootfs.join(format!("usr/bin/{}", app::TARGET_BINARY_NAME));
     // Use symlink_metadata to detect broken symlinks (exists() returns false for them)
     if fs::symlink_metadata(&link_path).is_ok() {
         fs::remove_file(&link_path)?;
@@ -725,10 +753,10 @@ fn update_brave(rootfs: &Path, download_url: &str, version: &str) -> Result<(), 
 
 fn check_self_update(force: bool) -> Result<bool, Box<dyn std::error::Error>> {
     let status = self_update::backends::github::Update::configure()
-        .repo_owner("nilltadios")
-        .repo_name("brave_box")
-        .bin_name("void_runner")
-        .identifier("void_runner")  // Match exact asset name
+        .repo_owner(app::SELF_UPDATE_OWNER)
+        .repo_name(app::SELF_UPDATE_REPO)
+        .bin_name(app::APP_NAME)
+        .identifier(app::APP_NAME)  // Match exact asset name
         .current_version(VERSION)
         .build()?;
 
@@ -748,27 +776,27 @@ fn check_self_update(force: bool) -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(false);
     }
 
-    println!("[void_runner] Self-update available: v{} -> v{}", VERSION, latest_version);
-    println!("[void_runner] Updating void_runner...");
+    println!("[{}] Self-update available: v{} -> v{}", app::APP_NAME, VERSION, latest_version);
+    println!("[{}] Updating {}...", app::APP_NAME, app::APP_NAME);
 
     let status = self_update::backends::github::Update::configure()
-        .repo_owner("nilltadios")
-        .repo_name("brave_box")
-        .bin_name("void_runner")
-        .identifier("void_runner")  // Match exact asset name
+        .repo_owner(app::SELF_UPDATE_OWNER)
+        .repo_name(app::SELF_UPDATE_REPO)
+        .bin_name(app::APP_NAME)
+        .identifier(app::APP_NAME)  // Match exact asset name
         .current_version(VERSION)
         .build()?
         .update()?;
 
-    println!("[void_runner] Updated to v{}", status.version());
+    println!("[{}] Updated to v{}", app::APP_NAME, status.version());
     Ok(true)
 }
 
 fn get_latest_self_version() -> Result<String, Box<dyn std::error::Error>> {
     let status = self_update::backends::github::Update::configure()
-        .repo_owner("nilltadios")
-        .repo_name("brave_box")
-        .bin_name("void_runner")
+        .repo_owner(app::SELF_UPDATE_OWNER)
+        .repo_name(app::SELF_UPDATE_REPO)
+        .bin_name(app::APP_NAME)
         .current_version(VERSION)
         .build()?;
 
@@ -861,7 +889,7 @@ root.mainloop()
 
     // 1. Fetch latest versions
     update_progress(2, "Fetching latest versions...", &mut gui_stdin);
-    let (brave_version, brave_url) = fetch_latest_brave_release()?;
+    let (app_version, app_url) = fetch_latest_target_release()?;
     let (ubuntu_version, ubuntu_url) = fetch_latest_ubuntu_base()?;
 
     // 2. Download Ubuntu Base
@@ -979,14 +1007,7 @@ apt-get install -y --no-install-recommends dbus dbus-user-session 2>&1 || true
 dbus-daemon --system --fork --nopidfile 2>/dev/null || true
 
 # Install all dependencies
-apt-get install -y --no-install-recommends \
-    curl unzip \
-    libnss3 libatk1.0-0t64 libatk-bridge2.0-0t64 \
-    libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
-    libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 libx11-xcb1 \
-    libx11-6 libxcb1 libdbus-1-3 libglib2.0-0t64 libgtk-3-0t64 libgl1-mesa-dri \
-    mesa-vulkan-drivers libegl1 libgles2 libpulse0 \
-    libasound2-plugins fonts-liberation dconf-gsettings-backend 2>&1 || true
+apt-get install -y --no-install-recommends {dependencies} 2>&1 || true
 
 # Force configure all packages (some may fail due to missing systemd, that's OK)
 dpkg --configure -a --force-confdef --force-confold --force-depends 2>/dev/null || true
@@ -995,7 +1016,7 @@ apt-get clean
 rm -rf /var/lib/apt/lists/*
 
 echo "Setup complete!"
-"#, codename = codename);
+"#, codename = codename, dependencies = app::DEPENDENCIES.trim());
 
     let setup_path = rootfs.join("setup.sh");
     fs::write(&setup_path, setup_script).map_err(|e| format!("Failed to write setup.sh: {}", e))?;
@@ -1013,7 +1034,7 @@ echo "Setup complete!"
             if !status.success() {
                 // Non-zero exit is expected due to systemd/dbus config issues in container
                 // The packages are still installed, just not fully configured
-                println!("[void_runner] Note: Some packages couldn't be fully configured (expected in container)");
+                println!("[{}] Note: Some packages couldn't be fully configured (expected in container)", app::APP_NAME);
             }
         },
         Err(e) => {
@@ -1022,11 +1043,11 @@ echo "Setup complete!"
     }
     let _ = fs::remove_file(&setup_path);
 
-    // 5. Download Brave
-    update_progress(70, &format!("Downloading Brave v{}...", brave_version), &mut gui_stdin);
+    // 5. Download target app
+    update_progress(70, &format!("Downloading {} v{}...", app::TARGET_APP_NAME, app_version), &mut gui_stdin);
 
-    let mut resp = ureq::get(&brave_url)
-        .header("User-Agent", "void_runner")
+    let mut resp = ureq::get(&app_url)
+        .header("User-Agent", app::APP_NAME)
         .call()?;
     let len = resp.headers()
         .get("Content-Length")
@@ -1035,8 +1056,8 @@ echo "Setup complete!"
         .unwrap_or(150_000_000);
 
     let mut reader = resp.body_mut().with_config().limit(500_000_000).reader();
-    let zip_path = rootfs.join("brave.zip");
-    let mut out = fs::File::create(&zip_path)?;
+    let archive_path = rootfs.join(format!("{}{}", app::TARGET_INSTALL_DIR, app::ASSET_EXTENSION));
+    let mut out = fs::File::create(&archive_path)?;
 
     let mut downloaded = 0u64;
     loop {
@@ -1047,45 +1068,60 @@ echo "Setup complete!"
 
         if downloaded % 2_000_000 < 8192 {
             let pct = 70 + (downloaded * 18 / len);
-            update_progress(pct, &format!("Downloading Brave v{}...", brave_version), &mut gui_stdin);
+            update_progress(pct, &format!("Downloading {} v{}...", app::TARGET_APP_NAME, app_version), &mut gui_stdin);
         }
     }
     drop(out);
 
-    update_progress(90, "Installing Brave...", &mut gui_stdin);
-    let file = fs::File::open(&zip_path)?;
-    let mut archive = zip::ZipArchive::new(file)?;
+    update_progress(90, &format!("Installing {}...", app::TARGET_APP_NAME), &mut gui_stdin);
 
-    let target_dir = rootfs.join("opt/brave");
+    let target_dir = rootfs.join(format!("opt/{}", app::TARGET_INSTALL_DIR));
     fs::create_dir_all(&target_dir)?;
 
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => target_dir.join(path),
-            None => continue,
-        };
+    // Extract based on archive type
+    match app::TARGET_ARCHIVE_TYPE {
+        app::ArchiveType::Zip => {
+            let file = fs::File::open(&archive_path)?;
+            let mut archive = zip::ZipArchive::new(file)?;
 
-        if file.name().ends_with('/') {
-            fs::create_dir_all(&outpath)?;
-        } else {
-            if let Some(p) = outpath.parent() {
-                if !p.exists() { fs::create_dir_all(p)?; }
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i)?;
+                let outpath = match file.enclosed_name() {
+                    Some(path) => target_dir.join(path),
+                    None => continue,
+                };
+
+                if file.name().ends_with('/') {
+                    fs::create_dir_all(&outpath)?;
+                } else {
+                    if let Some(p) = outpath.parent() {
+                        if !p.exists() { fs::create_dir_all(p)?; }
+                    }
+                    let mut outfile = fs::File::create(&outpath)?;
+                    std::io::copy(&mut file, &mut outfile)?;
+                }
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(mode) = file.unix_mode() {
+                        fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
+                    }
+                }
             }
-            let mut outfile = fs::File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)?;
         }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = file.unix_mode() {
-                fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
-            }
+        app::ArchiveType::TarGz => {
+            let file = fs::File::open(&archive_path)?;
+            let decoder = GzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(&target_dir)?;
+        }
+        app::ArchiveType::TarXz => {
+            return Err("TarXz archive type not yet supported".into());
         }
     }
 
-    fs::remove_file(zip_path)?;
+    fs::remove_file(archive_path)?;
 
     // Symlink
     update_progress(95, "Finalizing...", &mut gui_stdin);
@@ -1093,21 +1129,21 @@ echo "Setup complete!"
     let mut binary_path = PathBuf::new();
     for entry in WalkDir::new(&target_dir) {
         let entry = entry?;
-        if entry.file_name() == "brave" && entry.path().is_file() {
+        if entry.file_name() == app::TARGET_BINARY_NAME && entry.path().is_file() {
             binary_path = entry.path().to_path_buf();
             break;
         }
     }
 
     if binary_path.as_os_str().is_empty() {
-        return Err("Brave binary not found in zip".into());
+        return Err(format!("{} binary not found in archive", app::TARGET_APP_NAME).into());
     }
 
     let relative_path = binary_path.strip_prefix(rootfs)?;
     let container_path = Path::new("/").join(relative_path);
 
     fs::create_dir_all(rootfs.join("usr/bin"))?;
-    let link_path = rootfs.join("usr/bin/brave");
+    let link_path = rootfs.join(format!("usr/bin/{}", app::TARGET_BINARY_NAME));
     // Use symlink_metadata to detect broken symlinks (exists() returns false for them)
     if fs::symlink_metadata(&link_path).is_ok() {
         fs::remove_file(&link_path)?;
@@ -1116,23 +1152,26 @@ echo "Setup complete!"
 
     // Save version info
     let info = InstalledInfo {
-        brave_version: Some(brave_version),
+        app_version: Some(app_version),
         ubuntu_version: Some(ubuntu_version),
         installed_date: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
     };
     save_installed_info(data_dir, &info);
 
-    // Extract Brave icon for desktop launcher
-    let icon_src = target_dir.join("product_logo_128.png");
+    // Extract app icon for desktop launcher
+    let icon_src = target_dir.join(app::TARGET_ICON_FILENAME);
     if icon_src.exists() {
-        let icon_dst = data_dir.join("void_runner.png");
+        let icon_dst = data_dir.join(format!("{}.png", app::APP_NAME));
         let _ = fs::copy(&icon_src, &icon_dst);
 
         // Update .desktop file with the icon if it exists
         let desktop_path = get_desktop_file_path();
         if desktop_path.exists() {
             if let Ok(content) = fs::read_to_string(&desktop_path) {
-                let updated = content.replace("Icon=web-browser", &format!("Icon={}", icon_dst.display()));
+                let updated = content.replace(
+                    &format!("Icon={}", app::DESKTOP_FALLBACK_ICON),
+                    &format!("Icon={}", icon_dst.display())
+                );
                 let _ = fs::write(&desktop_path, updated);
             }
         }
@@ -1200,7 +1239,7 @@ fn setup_container(rootfs: &Path) -> Result<(), Box<dyn std::error::Error>> {
     umount2("/old_root", MntFlags::MNT_DETACH)?;
     fs::remove_dir("/old_root")?;
 
-    sethostname("void-runner")?;
+    sethostname(app::CONTAINER_HOSTNAME)?;
 
     unsafe {
         std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");

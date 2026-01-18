@@ -65,6 +65,41 @@ void_runner uninstall          # Removes binary and launcher, keeps browser data
 void_runner uninstall --purge  # Removes everything including browser data
 ```
 
+## Forking for Other Apps
+
+This project is designed to be easily forked for other applications like Discord, Firefox, VSCode, etc.
+
+All app-specific configuration is in **`src/app.rs`**. To fork:
+
+1. **Fork this repo**
+2. **Edit `src/app.rs`** - Change these values:
+   - `APP_NAME` - Binary name and data directory
+   - `APP_DISPLAY_NAME` - Name shown in app launcher
+   - `TARGET_APP_NAME` - The app you're containerizing
+   - `RELEASES_API` - GitHub releases API URL for your app
+   - `ASSET_*` patterns - How to find the right download asset
+   - `TARGET_BINARY_NAME` - The executable name inside the archive
+   - `TARGET_INSTALL_DIR` - Where to extract in /opt/
+   - `TARGET_ARCHIVE_TYPE` - Zip, TarGz, or TarXz
+   - `DEPENDENCIES` - Ubuntu packages your app needs
+   - `DEFAULT_LAUNCH_ARGS` - Command-line args for launching
+   - Desktop entry fields (categories, WM class, icon)
+   - Self-update GitHub owner/repo
+
+3. **Update `Cargo.toml`** - Change package name/version
+4. **Build and release!**
+
+Example: To fork for Firefox, you'd change:
+```rust
+pub const APP_NAME: &str = "firefox_box";
+pub const TARGET_APP_NAME: &str = "Firefox";
+pub const RELEASES_API: Option<&str> = None;  // Firefox uses direct downloads
+pub const TARGET_BINARY_NAME: &str = "firefox";
+// ... etc
+```
+
+For apps not on GitHub releases, set `RELEASES_API` to `None` and implement custom download logic.
+
 ## License
 
 MIT
