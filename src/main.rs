@@ -241,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 themes: false, // Don't mount themes/icons - let packages install
                 native_mode: false,
             };
-            setup_user_namespace()?;
+            setup_user_namespace(permissions.native_mode)?;
             setup_container_namespaces()?;
 
             let self_exe = std::env::current_exe()?;

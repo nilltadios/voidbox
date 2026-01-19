@@ -15,7 +15,7 @@ pub enum NamespaceError {
 }
 
 /// Setup user namespace with UID/GID mapping
-pub fn setup_user_namespace() -> Result<(), NamespaceError> {
+pub fn setup_user_namespace(_native_mode: bool) -> Result<(), NamespaceError> {
     let uid = getuid();
     let gid = getgid();
 
@@ -23,7 +23,10 @@ pub fn setup_user_namespace() -> Result<(), NamespaceError> {
     unshare(CloneFlags::CLONE_NEWUSER)
         .map_err(|e| NamespaceError::UnshareError(format!("CLONE_NEWUSER: {}", e)))?;
 
-    // Map UID/GID
+    // Map root (uid 0) inside to real user outside
+    // This gives us CAP_SYS_ADMIN inside the namespace for mount operations
+    // Note: Files owned by the real user will appear as "nobody" inside,
+    // but the process can still access them since it maps to the same uid.
     let uid_map = format!("0 {} 1", uid);
     let gid_map = format!("0 {} 1", gid);
 

@@ -2,6 +2,7 @@
 
 use crate::storage::paths;
 use std::fs;
+use std::path::Path;
 use thiserror::Error;
 use walkdir::WalkDir;
 
@@ -15,7 +16,7 @@ pub enum IconError {
 }
 
 /// Extract icon from app installation directory
-pub fn extract_icon(app_name: &str, icon_filename: Option<&str>) -> Result<(), IconError> {
+pub fn extract_icon(app_name: &str, icon_path: Option<&str>) -> Result<(), IconError> {
     let app_rootfs = paths::app_rootfs_dir(app_name);
     let icon_dest = paths::app_icon_path(app_name);
 
@@ -23,11 +24,33 @@ pub fn extract_icon(app_name: &str, icon_filename: Option<&str>) -> Result<(), I
         fs::create_dir_all(parent)?;
     }
 
-    // If specific filename provided, look for it
-    if let Some(filename) = icon_filename {
-        for entry in WalkDir::new(&app_rootfs).max_depth(5) {
+    // If specific path provided, try it directly first
+    if let Some(path) = icon_path {
+        // Try as a relative path from rootfs
+        let full_path = app_rootfs.join(path);
+        if full_path.exists() {
+            fs::copy(&full_path, &icon_dest)?;
+            return Ok(());
+        }
+
+        // Try from /opt directory (common for extracted apps)
+        let opt_path = app_rootfs.join("opt").join(app_name);
+        if opt_path.exists() {
+            for entry in WalkDir::new(&opt_path).max_depth(10) {
+                if let Ok(entry) = entry {
+                    if entry.path().ends_with(path) {
+                        fs::copy(entry.path(), &icon_dest)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Search for the filename anywhere in rootfs (deep search)
+        let filename = Path::new(path).file_name().unwrap_or_default();
+        for entry in WalkDir::new(&app_rootfs).max_depth(12) {
             if let Ok(entry) = entry {
-                if entry.file_name().to_string_lossy() == filename {
+                if entry.file_name() == filename {
                     fs::copy(entry.path(), &icon_dest)?;
                     return Ok(());
                 }
@@ -35,7 +58,7 @@ pub fn extract_icon(app_name: &str, icon_filename: Option<&str>) -> Result<(), I
         }
     }
 
-    // Otherwise search for common icon patterns
+    // Search for common icon patterns
     let patterns = [
         format!("{}.png", app_name),
         format!("{}.svg", app_name),
@@ -44,9 +67,10 @@ pub fn extract_icon(app_name: &str, icon_filename: Option<&str>) -> Result<(), I
         "logo.png".to_string(),
         "product_logo_128.png".to_string(),
         "app.png".to_string(),
+        "code.png".to_string(), // VSCode
     ];
 
-    for entry in WalkDir::new(&app_rootfs).max_depth(5) {
+    for entry in WalkDir::new(&app_rootfs).max_depth(12) {
         if let Ok(entry) = entry {
             let name = entry.file_name().to_string_lossy().to_lowercase();
             for pattern in &patterns {

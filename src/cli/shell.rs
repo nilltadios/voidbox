@@ -47,7 +47,7 @@ pub fn shell(app_name: &str, dev_mode: bool) -> Result<(), ShellError> {
     println!();
 
     // Setup namespaces
-    setup_user_namespace()?;
+    setup_user_namespace(permissions.native_mode)?;
     setup_container_namespaces()?;
 
     // Spawn shell with permissions

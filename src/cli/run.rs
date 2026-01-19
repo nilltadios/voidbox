@@ -67,7 +67,7 @@ pub fn run_app(
     let (cmd, cmd_args) = build_command(&manifest, args, url, &rootfs)?;
 
     // Setup namespaces
-    setup_user_namespace()?;
+    setup_user_namespace(permissions.native_mode)?;
     setup_container_namespaces()?;
 
     // Spawn container init process with permissions
