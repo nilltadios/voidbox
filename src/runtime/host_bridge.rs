@@ -4,14 +4,15 @@
 //! commands on the host system (like sudo) with full PTY support
 //! for interactive commands.
 
+use sha2::{Digest, Sha256};
 use std::ffi::CString;
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -45,12 +46,30 @@ fn open_pty() -> Result<(OwnedFd, OwnedFd), BridgeError> {
     }
 }
 
+fn generate_token() -> String {
+    let mut hasher = Sha256::new();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    let x = 0;
+    let stack_addr = &x as *const i32 as usize;
+
+    hasher.update(timestamp.to_le_bytes());
+    hasher.update(pid.to_le_bytes());
+    hasher.update(stack_addr.to_le_bytes());
+
+    hex::encode(hasher.finalize())
+}
+
 /// Start the host bridge listener in a background thread
 /// Uses port 0 to let OS assign an available port
 pub fn start_host_bridge() -> Result<BridgeHandle, BridgeError> {
     // Bind to port 0 - OS will assign an available port
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
+    let token = generate_token();
 
     eprintln!("[voidbox] Host bridge listening on 127.0.0.1:{}", port);
 
@@ -58,9 +77,10 @@ pub fn start_host_bridge() -> Result<BridgeHandle, BridgeError> {
 
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
+    let token_clone = token.clone();
 
     let handle = thread::spawn(move || {
-        host_bridge_loop(listener, running_clone);
+        host_bridge_loop(listener, running_clone, token_clone);
     });
 
     thread::sleep(Duration::from_millis(50));
@@ -69,6 +89,7 @@ pub fn start_host_bridge() -> Result<BridgeHandle, BridgeError> {
         running,
         _thread: handle,
         port,
+        token,
     })
 }
 
@@ -76,11 +97,16 @@ pub struct BridgeHandle {
     running: Arc<AtomicBool>,
     _thread: thread::JoinHandle<()>,
     port: u16,
+    token: String,
 }
 
 impl BridgeHandle {
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
     }
 }
 
@@ -91,46 +117,101 @@ impl Drop for BridgeHandle {
     }
 }
 
-fn host_bridge_loop(listener: TcpListener, running: Arc<AtomicBool>) {
+fn host_bridge_loop(listener: TcpListener, running: Arc<AtomicBool>, token: String) {
+    let listener_fd = listener.as_raw_fd();
+
     while running.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                thread::spawn(move || {
-                    if let Err(e) = handle_interactive_connection(stream) {
-                        eprintln!("[voidbox-bridge] Connection error: {}", e);
-                    }
-                });
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                eprintln!("[voidbox-bridge] Accept error: {}", e);
+        // Use poll to wait for connection or timeout
+        // This avoids busy waiting
+        let mut poll_fds = [libc::pollfd {
+            fd: listener_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+
+        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), 1, 500) };
+
+        if ret < 0 {
+            // Error in poll
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                eprintln!("[voidbox-bridge] Poll error: {}", err);
                 thread::sleep(Duration::from_millis(100));
+            }
+            continue;
+        }
+
+        if ret == 0 {
+            continue; // Timeout, check running flag
+        }
+
+        if poll_fds[0].revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let token_clone = token.clone();
+                    thread::spawn(move || {
+                        if let Err(e) = handle_interactive_connection(stream, &token_clone) {
+                            eprintln!("[voidbox-bridge] Connection error: {}", e);
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Should not happen with poll, but handle safely
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[voidbox-bridge] Accept error: {}", e);
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }
 }
 
-fn handle_interactive_connection(mut stream: TcpStream) -> Result<(), BridgeError> {
+fn handle_interactive_connection(
+    mut stream: TcpStream,
+    expected_token: &str,
+) -> Result<(), BridgeError> {
     let mut buf = [0u8; 4096];
-    let mut cmd_line = String::new();
+    let mut line_buf = String::new();
 
     stream.set_nonblocking(false)?;
 
-    // Read command line until newline
-    loop {
-        let n = stream.read(&mut buf[..1])?;
-        if n == 0 {
-            return Ok(());
+    // Helper to read a line
+    let mut read_line = |out: &mut String| -> Result<bool, BridgeError> {
+        out.clear();
+        loop {
+            let n = stream.read(&mut buf[..1])?;
+            if n == 0 {
+                return Ok(false); // EOF
+            }
+            if buf[0] == b'\n' {
+                return Ok(true);
+            }
+            out.push(buf[0] as char);
+
+            // Limit line length to prevent DoS
+            if out.len() > 1024 {
+                return Err(BridgeError::BridgeFailed("Line too long".to_string()));
+            }
         }
-        if buf[0] == b'\n' {
-            break;
-        }
-        cmd_line.push(buf[0] as char);
+    };
+
+    // 1. Read and verify token
+    if !read_line(&mut line_buf)? {
+        return Ok(());
+    }
+    let received_token = line_buf.trim();
+    if received_token != expected_token {
+        eprintln!("[voidbox-bridge] Invalid token received. Rejecting connection.");
+        return Ok(());
     }
 
-    let cmd_line = cmd_line.trim();
+    // 2. Read command
+    if !read_line(&mut line_buf)? {
+        return Ok(());
+    }
+    let cmd_line = line_buf.trim();
     if cmd_line.is_empty() {
         return Ok(());
     }
@@ -181,7 +262,13 @@ fn handle_interactive_connection(mut stream: TcpStream) -> Result<(), BridgeErro
 
             libc::execvp(
                 shell.as_ptr(),
-                [arg0.as_ptr(), arg1.as_ptr(), arg2.as_ptr(), std::ptr::null()].as_ptr(),
+                [
+                    arg0.as_ptr(),
+                    arg1.as_ptr(),
+                    arg2.as_ptr(),
+                    std::ptr::null(),
+                ]
+                .as_ptr(),
             );
 
             libc::_exit(1);
@@ -245,7 +332,8 @@ fn forward_pty_socket(master_fd: i32, stream: &mut TcpStream) -> Result<(), Brid
 
         // PTY -> socket
         if poll_fds[0].revents & libc::POLLIN != 0 {
-            let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n =
+                unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n > 0 {
                 if stream.write_all(&buf[..n as usize]).is_err() {
                     return Ok(());
@@ -270,9 +358,8 @@ fn forward_pty_socket(master_fd: i32, stream: &mut TcpStream) -> Result<(), Brid
             match stream.read(&mut buf) {
                 Ok(0) => return Ok(()), // Socket closed
                 Ok(n) => {
-                    let written = unsafe {
-                        libc::write(master_fd, buf.as_ptr() as *const libc::c_void, n)
-                    };
+                    let written =
+                        unsafe { libc::write(master_fd, buf.as_ptr() as *const libc::c_void, n) };
                     if written < 0 {
                         return Ok(());
                     }

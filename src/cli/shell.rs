@@ -1,10 +1,12 @@
 //! Shell command implementation
 
 use crate::manifest::{PermissionConfig, parse_manifest_file};
-use crate::runtime::{setup_container_namespaces, setup_user_namespace, spawn_container_init, start_host_bridge};
+use crate::runtime::{
+    setup_container_namespaces, setup_user_namespace, spawn_container_init, start_host_bridge,
+};
 use crate::storage::paths;
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{fork, ForkResult};
+use nix::sys::wait::{WaitStatus, waitpid};
+use nix::unistd::{ForkResult, fork};
 use std::path::Path;
 use thiserror::Error;
 
@@ -119,7 +121,10 @@ fn shell_with_host_bridge(
             Ok(())
         }
         Ok(ForkResult::Child) => {
-            unsafe { std::env::set_var("VOIDBOX_BRIDGE_PORT", bridge_port.to_string()); }
+            unsafe {
+                std::env::set_var("VOIDBOX_BRIDGE_PORT", bridge_port.to_string());
+                std::env::set_var("VOIDBOX_BRIDGE_TOKEN", bridge_handle.token());
+            }
 
             setup_user_namespace(permissions.native_mode)?;
             setup_container_namespaces()?;
@@ -130,8 +135,6 @@ fn shell_with_host_bridge(
 
             std::process::exit(status.code().unwrap_or(1));
         }
-        Err(e) => {
-            Err(ShellError::Failed(format!("Fork failed: {}", e)))
-        }
+        Err(e) => Err(ShellError::Failed(format!("Fork failed: {}", e))),
     }
 }

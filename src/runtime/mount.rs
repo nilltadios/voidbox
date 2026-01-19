@@ -4,7 +4,7 @@ use crate::manifest::PermissionConfig;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::unistd::{chdir, pivot_root, sethostname};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use thiserror::Error;
 
@@ -226,32 +226,68 @@ pub fn get_bind_mounts(permissions: &PermissionConfig) -> Vec<BindMount> {
     mounts
 }
 
-/// Generate synthetic /etc/passwd content that maps UID 0 to host username
-fn generate_passwd_content() -> String {
+/// Generate synthetic /etc/passwd content that preserves system users but maps UID 0 to host username
+fn generate_passwd_content(rootfs: &Path) -> Result<String, std::io::Error> {
+    let mut content = String::new();
+    let etc_passwd = rootfs.join("etc/passwd");
+
+    if etc_passwd.exists() {
+        let mut file = fs::File::open(&etc_passwd)?;
+        file.read_to_string(&mut content)?;
+    }
+
     let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
     let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{}", username));
 
+    let mut new_content = String::new();
+
+    // Filter out existing root entry if present, keep others
+    for line in content.lines() {
+        if line.starts_with("root:") {
+            continue;
+        }
+        new_content.push_str(line);
+        new_content.push('\n');
+    }
+
     // Map UID 0 to the host username so whoami returns the correct name
     // Format: name:password:uid:gid:gecos:home:shell
-    format!(
-        "{}:x:0:0:{}:/{}:/bin/bash\n\
-         nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
+    new_content.push_str(&format!(
+        "{}:x:0:0:{}:/{}:/bin/bash\n",
         username,
         username,
         home.trim_start_matches('/')
-    )
+    ));
+
+    Ok(new_content)
 }
 
 /// Generate synthetic /etc/group content
-fn generate_group_content() -> String {
+fn generate_group_content(rootfs: &Path) -> Result<String, std::io::Error> {
+    let mut content = String::new();
+    let etc_group = rootfs.join("etc/group");
+
+    if etc_group.exists() {
+        let mut file = fs::File::open(&etc_group)?;
+        file.read_to_string(&mut content)?;
+    }
+
     let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+    let mut new_content = String::new();
+
+    // Filter out existing root group
+    for line in content.lines() {
+        if line.starts_with("root:") {
+            continue;
+        }
+        new_content.push_str(line);
+        new_content.push('\n');
+    }
 
     // Map GID 0 to a group named after the user
-    format!(
-        "{}:x:0:{}\n\
-         nobody:x:65534:\n",
-        username, username
-    )
+    new_content.push_str(&format!("{}:x:0:{}\n", username, username));
+
+    Ok(new_content)
 }
 
 /// Setup synthetic passwd/group files in container for native feel
@@ -265,12 +301,12 @@ pub fn setup_user_identity(rootfs: &Path) -> Result<(), MountError> {
     // Write synthetic passwd
     let passwd_path = voidbox_dir.join("passwd");
     let mut passwd_file = fs::File::create(&passwd_path)?;
-    passwd_file.write_all(generate_passwd_content().as_bytes())?;
+    passwd_file.write_all(generate_passwd_content(rootfs)?.as_bytes())?;
 
     // Write synthetic group
     let group_path = voidbox_dir.join("group");
     let mut group_file = fs::File::create(&group_path)?;
-    group_file.write_all(generate_group_content().as_bytes())?;
+    group_file.write_all(generate_group_content(rootfs)?.as_bytes())?;
 
     // Bind mount over /etc/passwd and /etc/group
     let etc_passwd = rootfs.join("etc/passwd");
@@ -294,7 +330,8 @@ pub fn setup_user_identity(rootfs: &Path) -> Result<(), MountError> {
         None::<&str>,
         MsFlags::MS_BIND,
         None::<&str>,
-    ).map_err(|e| MountError::MountFailed(format!("bind passwd: {}", e)))?;
+    )
+    .map_err(|e| MountError::MountFailed(format!("bind passwd: {}", e)))?;
 
     mount(
         Some(&group_path),
@@ -302,9 +339,13 @@ pub fn setup_user_identity(rootfs: &Path) -> Result<(), MountError> {
         None::<&str>,
         MsFlags::MS_BIND,
         None::<&str>,
-    ).map_err(|e| MountError::MountFailed(format!("bind group: {}", e)))?;
+    )
+    .map_err(|e| MountError::MountFailed(format!("bind group: {}", e)))?;
 
-    eprintln!("[voidbox] User identity: {} (native feel enabled)", username);
+    eprintln!(
+        "[voidbox] User identity: {} (native feel enabled)",
+        username
+    );
 
     Ok(())
 }
@@ -416,17 +457,19 @@ pub fn pivot_to_container(rootfs: &Path, permissions: &PermissionConfig) -> Resu
 
 /// Setup the sudo shim and other host bridge scripts in the container
 /// This must be called AFTER pivot_root when we're inside the container
-pub fn setup_host_bridge_shims(port: u16) -> Result<(), MountError> {
+pub fn setup_host_bridge_shims(port: u16, token: &str) -> Result<(), MountError> {
     // Create /.voidbox/bin for our shims
     let shim_dir = Path::new("/.voidbox/bin");
     fs::create_dir_all(shim_dir)?;
 
     // Create the sudo shim script with full interactive PTY support
-    let sudo_shim = format!(r#"#!/bin/bash
+    let sudo_shim = format!(
+        r#"#!/bin/bash
 # VoidBox sudo shim - bridges to host for privileged operations with full PTY
 # Port: {}
 
 PORT={}
+TOKEN="{}"
 CMD="$*"
 
 # Connect to host bridge
@@ -436,7 +479,13 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Send the command (protocol: first line is command, then bidirectional I/O)
+# Cleanup on exit (kills background cat)
+trap "kill \$stdin_pid 2>/dev/null; exec 3<&-" EXIT
+
+# Send authentication token
+echo "$TOKEN" >&3
+
+# Send the command
 echo "SUDO $CMD" >&3
 
 # Forward stdin to socket in background
@@ -446,10 +495,10 @@ stdin_pid=$!
 # Forward socket to stdout (this blocks until connection closes)
 cat <&3 2>/dev/null
 
-# Cleanup
-kill $stdin_pid 2>/dev/null
-exec 3<&-
-"#, port, port);
+exit 0
+"#,
+        port, port, token
+    );
 
     let sudo_path = shim_dir.join("sudo");
     let mut sudo_file = fs::File::create(&sudo_path)?;
@@ -463,9 +512,11 @@ exec 3<&-
     }
 
     // Also create a host-exec shim for running arbitrary commands on host
-    let host_exec_shim = format!(r#"#!/bin/bash
+    let host_exec_shim = format!(
+        r#"#!/bin/bash
 # VoidBox host-exec - run commands on the host system with full PTY
 PORT={}
+TOKEN="{}"
 CMD="$*"
 
 exec 3<>/dev/tcp/127.0.0.1/$PORT 2>/dev/null
@@ -474,6 +525,9 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+trap "kill \$stdin_pid 2>/dev/null; exec 3<&-" EXIT
+
+echo "$TOKEN" >&3
 echo "EXEC $CMD" >&3
 
 cat <&0 >&3 2>/dev/null &
@@ -481,9 +535,10 @@ stdin_pid=$!
 
 cat <&3 2>/dev/null
 
-kill $stdin_pid 2>/dev/null
-exec 3<&-
-"#, port);
+exit 0
+"#,
+        port, token
+    );
 
     let host_exec_path = shim_dir.join("host-exec");
     let mut host_exec_file = fs::File::create(&host_exec_path)?;
@@ -503,8 +558,9 @@ pub fn setup_container_env(permissions: &PermissionConfig) {
     unsafe {
         // In native mode, preserve the host PATH but prepend our shim directory
         if permissions.native_mode {
-            let current_path = std::env::var("PATH")
-                .unwrap_or_else(|_| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
+            let current_path = std::env::var("PATH").unwrap_or_else(|_| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+            });
             // Prepend /.voidbox/bin so our sudo shim takes precedence
             std::env::set_var("PATH", format!("/.voidbox/bin:{}", current_path));
         } else {

@@ -88,8 +88,11 @@ pub fn init_and_exec(
     args: &[String],
     permissions: &PermissionConfig,
 ) -> Result<(), ExecError> {
-    use super::mount::{pivot_to_container, setup_container_env, setup_container_mounts, setup_host_bridge_shims, setup_user_identity};
-    use nix::sys::wait::{waitpid, WaitStatus};
+    use super::mount::{
+        pivot_to_container, setup_container_env, setup_container_mounts, setup_host_bridge_shims,
+        setup_user_identity,
+    };
+    use nix::sys::wait::{WaitStatus, waitpid};
     use nix::unistd::Pid;
 
     setup_container_mounts(rootfs, permissions)
@@ -109,8 +112,12 @@ pub fn init_and_exec(
     // Setup host bridge shims (sudo, host-exec) if bridge port is available
     if let Ok(port_str) = std::env::var("VOIDBOX_BRIDGE_PORT") {
         if let Ok(port) = port_str.parse::<u16>() {
-            if let Err(e) = setup_host_bridge_shims(port) {
-                eprintln!("[voidbox] Warning: Failed to setup host bridge shims: {}", e);
+            let token = std::env::var("VOIDBOX_BRIDGE_TOKEN").unwrap_or_default();
+            if let Err(e) = setup_host_bridge_shims(port, &token) {
+                eprintln!(
+                    "[voidbox] Warning: Failed to setup host bridge shims: {}",
+                    e
+                );
             }
         }
     }
@@ -138,7 +145,8 @@ pub fn init_and_exec(
         .map_err(|e| ExecError::ExecFailed(format!("{}: {}", cmd, e)))?;
 
     // Wait for direct child first
-    let status = child.wait()
+    let status = child
+        .wait()
         .map_err(|e| ExecError::ExecFailed(format!("wait: {}", e)))?;
     let exit_code = status.code().unwrap_or(1);
 

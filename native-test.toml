@@ -1,0 +1,27 @@
+[app]
+name = "native-test"
+display_name = "Native Test"
+description = "Test for native environment features"
+license = "MIT"
+
+[source]
+type = "local" # We won't actually download anything, just use local shell
+url = ""
+
+[runtime]
+base = "ubuntu:24.04"
+arch = ["x86_64"]
+
+[dependencies]
+packages = []
+
+[binary]
+name = "bash"
+install_dir = "bin"
+path = "bin/bash"
+
+[permissions]
+network = true
+dev_mode = true
+native_mode = true
+home = true

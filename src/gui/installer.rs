@@ -250,11 +250,23 @@ impl eframe::App for InstallerApp {
                                 let spacing = (total_width - button_width * 2.0) / 3.0;
 
                                 ui.add_space(spacing);
-                                if ui.add_sized([button_width, 35.0], egui::Button::new(RichText::new("Cancel").size(14.0))).clicked() {
+                                if ui
+                                    .add_sized(
+                                        [button_width, 35.0],
+                                        egui::Button::new(RichText::new("Cancel").size(14.0)),
+                                    )
+                                    .clicked()
+                                {
                                     std::process::exit(0);
                                 }
                                 ui.add_space(spacing);
-                                if ui.add_sized([button_width, 35.0], egui::Button::new(RichText::new("Install").size(14.0))).clicked() {
+                                if ui
+                                    .add_sized(
+                                        [button_width, 35.0],
+                                        egui::Button::new(RichText::new("Install").size(14.0)),
+                                    )
+                                    .clicked()
+                                {
                                     self.start_installation();
                                 }
                             });
@@ -267,11 +279,7 @@ impl eframe::App for InstallerApp {
                                     .color(TEXT_PRIMARY),
                             );
                             ui.add_space(15.0);
-                            ui.label(
-                                RichText::new(message)
-                                    .size(13.0)
-                                    .color(TEXT_SECONDARY),
-                            );
+                            ui.label(RichText::new(message).size(13.0).color(TEXT_SECONDARY));
                             ui.add_space(20.0);
                             ui.add(
                                 egui::ProgressBar::new(*progress)
@@ -281,11 +289,7 @@ impl eframe::App for InstallerApp {
                         }
                         InstallerState::Done { message } => {
                             ui.add_space(10.0);
-                            ui.label(
-                                RichText::new("✓")
-                                    .size(40.0)
-                                    .color(SUCCESS_COLOR),
-                            );
+                            ui.label(RichText::new("✓").size(40.0).color(SUCCESS_COLOR));
                             ui.add_space(10.0);
                             ui.label(
                                 RichText::new("Installation Complete")
@@ -293,11 +297,7 @@ impl eframe::App for InstallerApp {
                                     .color(SUCCESS_COLOR),
                             );
                             ui.add_space(10.0);
-                            ui.label(
-                                RichText::new(message)
-                                    .size(12.0)
-                                    .color(TEXT_SECONDARY),
-                            );
+                            ui.label(RichText::new(message).size(12.0).color(TEXT_SECONDARY));
                             ui.add_space(25.0);
                             if ui.button(RichText::new("Close").size(14.0)).clicked() {
                                 std::process::exit(0);
@@ -305,11 +305,7 @@ impl eframe::App for InstallerApp {
                         }
                         InstallerState::Error { message } => {
                             ui.add_space(10.0);
-                            ui.label(
-                                RichText::new("✗")
-                                    .size(40.0)
-                                    .color(ERROR_COLOR),
-                            );
+                            ui.label(RichText::new("✗").size(40.0).color(ERROR_COLOR));
                             ui.add_space(10.0);
                             ui.label(
                                 RichText::new("Installation Failed")
@@ -317,11 +313,7 @@ impl eframe::App for InstallerApp {
                                     .color(ERROR_COLOR),
                             );
                             ui.add_space(10.0);
-                            ui.label(
-                                RichText::new(message)
-                                    .size(12.0)
-                                    .color(TEXT_SECONDARY),
-                            );
+                            ui.label(RichText::new(message).size(12.0).color(TEXT_SECONDARY));
                             ui.add_space(25.0);
                             if ui.button(RichText::new("Close").size(14.0)).clicked() {
                                 std::process::exit(1);
