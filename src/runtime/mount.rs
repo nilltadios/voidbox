@@ -379,5 +379,10 @@ pub fn setup_container_env(permissions: &PermissionConfig) {
         if let Ok(wayland_display) = std::env::var("WAYLAND_DISPLAY") {
             std::env::set_var("WAYLAND_DISPLAY", wayland_display);
         }
+
+        // D-Bus session bus (for file dialogs via xdg-desktop-portal, notifications, etc.)
+        if let Ok(dbus_addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", dbus_addr);
+        }
     }
 }

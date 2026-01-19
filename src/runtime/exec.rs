@@ -84,6 +84,8 @@ pub fn init_and_exec(
     permissions: &PermissionConfig,
 ) -> Result<(), ExecError> {
     use super::mount::{pivot_to_container, setup_container_env, setup_container_mounts};
+    use nix::sys::wait::{waitpid, WaitStatus};
+    use nix::unistd::Pid;
 
     setup_container_mounts(rootfs, permissions)
         .map_err(|e| ExecError::ExecFailed(format!("mount setup: {}", e)))?;
@@ -92,7 +94,44 @@ pub fn init_and_exec(
         .map_err(|e| ExecError::ExecFailed(format!("pivot_root: {}", e)))?;
 
     setup_container_env(permissions);
-    start_dbus()?;
 
-    exec_replace(cmd, args)
+    // Only start dbus in non-native mode; native_mode uses host's D-Bus
+    if !permissions.native_mode {
+        start_dbus()?;
+    }
+
+    // Become a subreaper so orphaned child processes are reparented to us
+    // This is crucial for apps like VSCode where the launcher script exits
+    // after spawning the actual Electron process
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+    }
+
+    // Spawn app as child process
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| ExecError::ExecFailed(format!("{}: {}", cmd, e)))?;
+
+    // Wait for direct child first
+    let status = child.wait()
+        .map_err(|e| ExecError::ExecFailed(format!("wait: {}", e)))?;
+    let exit_code = status.code().unwrap_or(1);
+
+    // Keep reaping orphaned children until none remain
+    // This handles apps that spawn processes and exit (like VSCode's launcher)
+    loop {
+        match waitpid(Pid::from_raw(-1), None) {
+            Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => continue,
+            Ok(_) => continue,
+            Err(nix::errno::Errno::ECHILD) => break, // No more children
+            Err(_) => break,
+        }
+    }
+
+    std::process::exit(exit_code);
 }

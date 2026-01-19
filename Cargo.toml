@@ -1,6 +1,6 @@
 [package]
 name = "voidbox"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 description = "Universal Linux App Platform - portable, isolated application environments"
 license = "MIT"
@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
 nix = { version = "0.30", features = ["fs", "sched", "mount", "user", "process", "signal", "hostname"] }
 ureq = { version = "3.1", features = ["json"] }
 flate2 = "1.0"
