@@ -1,9 +1,11 @@
 //! Run command implementation
 
 use crate::manifest::{AppManifest, PermissionConfig, parse_manifest_file};
-use crate::runtime::{setup_container_namespaces, setup_user_namespace, spawn_container_init};
+use crate::runtime::{setup_container_namespaces, setup_user_namespace, spawn_container_init, start_host_bridge};
 use crate::settings::{load_overrides, merge_permissions};
 use crate::storage::paths;
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{fork, ForkResult};
 use std::path::Path;
 use thiserror::Error;
 
@@ -29,6 +31,9 @@ pub enum RunError {
 
     #[error("Run failed: {0}")]
     Failed(String),
+
+    #[error("Bridge error: {0}")]
+    BridgeError(#[from] crate::runtime::BridgeError),
 }
 
 /// Run an installed app
@@ -66,19 +71,93 @@ pub fn run_app(
     // Build command and args
     let (cmd, cmd_args) = build_command(&manifest, args, url, &rootfs)?;
 
+    // If native_mode, we need to fork BEFORE namespace setup
+    // Parent stays on host to run the bridge, child enters namespaces
+    if permissions.native_mode {
+        run_with_host_bridge(&rootfs, &cmd, &cmd_args, &permissions)?;
+    } else {
+        run_in_container(&rootfs, &cmd, &cmd_args, &permissions)?;
+    }
+
+    Ok(())
+}
+
+/// Run app without host bridge (standard container mode)
+fn run_in_container(
+    rootfs: &Path,
+    cmd: &str,
+    args: &[String],
+    permissions: &PermissionConfig,
+) -> Result<(), RunError> {
     // Setup namespaces
     setup_user_namespace(permissions.native_mode)?;
     setup_container_namespaces()?;
 
     // Spawn container init process with permissions
     let self_exe = std::env::current_exe()?;
-    let status = spawn_container_init(&self_exe, &rootfs, &cmd, &cmd_args, &permissions)?;
+    let status = spawn_container_init(&self_exe, rootfs, cmd, args, permissions)?;
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
 
     Ok(())
+}
+
+/// Run app with host bridge for native mode
+/// Forks: parent runs bridge, child runs container
+fn run_with_host_bridge(
+    rootfs: &Path,
+    cmd: &str,
+    args: &[String],
+    permissions: &PermissionConfig,
+) -> Result<(), RunError> {
+    // Start the host bridge BEFORE forking so it's available
+    let bridge_handle = start_host_bridge()?;
+    let bridge_port = bridge_handle.port();
+
+    // Fork: parent stays on host for bridge, child enters namespaces
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child }) => {
+            // Parent: wait for child (the container) to exit
+            // Keep bridge_handle alive - it runs in a background thread
+            let _bridge = bridge_handle;
+            loop {
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => {
+                        std::process::exit(code);
+                    }
+                    Ok(WaitStatus::Signaled(_, sig, _)) => {
+                        // Child killed by signal
+                        std::process::exit(128 + sig as i32);
+                    }
+                    Ok(_) => continue, // Other status, keep waiting
+                    Err(nix::errno::Errno::ECHILD) => break, // No more children
+                    Err(e) => {
+                        eprintln!("[voidbox] Wait error: {}", e);
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Ok(ForkResult::Child) => {
+            // Child: setup namespaces and run container
+            // Set the bridge port for the container to use
+            unsafe { std::env::set_var("VOIDBOX_BRIDGE_PORT", bridge_port.to_string()); }
+
+            setup_user_namespace(permissions.native_mode)?;
+            setup_container_namespaces()?;
+
+            let self_exe = std::env::current_exe()?;
+            let status = spawn_container_init(&self_exe, rootfs, cmd, args, permissions)?;
+
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Err(e) => {
+            Err(RunError::Failed(format!("Fork failed: {}", e)))
+        }
+    }
 }
 
 /// Build the command and arguments to run

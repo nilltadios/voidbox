@@ -43,7 +43,8 @@ pub fn spawn_container_init(
     let permissions_json = serde_json::to_string(permissions)
         .map_err(|e| ExecError::ExecFailed(format!("failed to serialize permissions: {}", e)))?;
 
-    let mut child = Command::new(self_exe)
+    let mut command = Command::new(self_exe);
+    command
         .arg("internal-init")
         .arg(rootfs)
         .arg(cmd)
@@ -53,8 +54,12 @@ pub fn spawn_container_init(
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .stderr(Stdio::inherit());
+
+    // VOIDBOX_BRIDGE_PORT is set by run.rs/shell.rs before calling this
+    // and will be inherited by the spawned child
+
+    let mut child = command.spawn()?;
 
     Ok(child.wait()?)
 }
@@ -83,17 +88,32 @@ pub fn init_and_exec(
     args: &[String],
     permissions: &PermissionConfig,
 ) -> Result<(), ExecError> {
-    use super::mount::{pivot_to_container, setup_container_env, setup_container_mounts};
+    use super::mount::{pivot_to_container, setup_container_env, setup_container_mounts, setup_host_bridge_shims, setup_user_identity};
     use nix::sys::wait::{waitpid, WaitStatus};
     use nix::unistd::Pid;
 
     setup_container_mounts(rootfs, permissions)
         .map_err(|e| ExecError::ExecFailed(format!("mount setup: {}", e)))?;
 
+    // Setup user identity masquerade (makes whoami return host username)
+    if permissions.native_mode {
+        setup_user_identity(rootfs)
+            .map_err(|e| ExecError::ExecFailed(format!("user identity setup: {}", e)))?;
+    }
+
     pivot_to_container(rootfs, permissions)
         .map_err(|e| ExecError::ExecFailed(format!("pivot_root: {}", e)))?;
 
     setup_container_env(permissions);
+
+    // Setup host bridge shims (sudo, host-exec) if bridge port is available
+    if let Ok(port_str) = std::env::var("VOIDBOX_BRIDGE_PORT") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            if let Err(e) = setup_host_bridge_shims(port) {
+                eprintln!("[voidbox] Warning: Failed to setup host bridge shims: {}", e);
+            }
+        }
+    }
 
     // Only start dbus in non-native mode; native_mode uses host's D-Bus
     if !permissions.native_mode {

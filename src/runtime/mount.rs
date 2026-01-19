@@ -4,6 +4,7 @@ use crate::manifest::PermissionConfig;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::unistd::{chdir, pivot_root, sethostname};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
 
@@ -225,6 +226,89 @@ pub fn get_bind_mounts(permissions: &PermissionConfig) -> Vec<BindMount> {
     mounts
 }
 
+/// Generate synthetic /etc/passwd content that maps UID 0 to host username
+fn generate_passwd_content() -> String {
+    let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{}", username));
+
+    // Map UID 0 to the host username so whoami returns the correct name
+    // Format: name:password:uid:gid:gecos:home:shell
+    format!(
+        "{}:x:0:0:{}:/{}:/bin/bash\n\
+         nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
+        username,
+        username,
+        home.trim_start_matches('/')
+    )
+}
+
+/// Generate synthetic /etc/group content
+fn generate_group_content() -> String {
+    let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+
+    // Map GID 0 to a group named after the user
+    format!(
+        "{}:x:0:{}\n\
+         nobody:x:65534:\n",
+        username, username
+    )
+}
+
+/// Setup synthetic passwd/group files in container for native feel
+pub fn setup_user_identity(rootfs: &Path) -> Result<(), MountError> {
+    let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+
+    // Create .voidbox directory for our synthetic files
+    let voidbox_dir = rootfs.join(".voidbox");
+    fs::create_dir_all(&voidbox_dir)?;
+
+    // Write synthetic passwd
+    let passwd_path = voidbox_dir.join("passwd");
+    let mut passwd_file = fs::File::create(&passwd_path)?;
+    passwd_file.write_all(generate_passwd_content().as_bytes())?;
+
+    // Write synthetic group
+    let group_path = voidbox_dir.join("group");
+    let mut group_file = fs::File::create(&group_path)?;
+    group_file.write_all(generate_group_content().as_bytes())?;
+
+    // Bind mount over /etc/passwd and /etc/group
+    let etc_passwd = rootfs.join("etc/passwd");
+    let etc_group = rootfs.join("etc/group");
+
+    // Ensure /etc exists
+    fs::create_dir_all(rootfs.join("etc"))?;
+
+    // Create empty target files if they don't exist (for bind mount)
+    if !etc_passwd.exists() {
+        fs::File::create(&etc_passwd)?;
+    }
+    if !etc_group.exists() {
+        fs::File::create(&etc_group)?;
+    }
+
+    // Bind mount synthetic files
+    mount(
+        Some(&passwd_path),
+        &etc_passwd,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    ).map_err(|e| MountError::MountFailed(format!("bind passwd: {}", e)))?;
+
+    mount(
+        Some(&group_path),
+        &etc_group,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    ).map_err(|e| MountError::MountFailed(format!("bind group: {}", e)))?;
+
+    eprintln!("[voidbox] User identity: {} (native feel enabled)", username);
+
+    Ok(())
+}
+
 /// Setup container filesystem with bind mounts
 pub fn setup_container_mounts(
     rootfs: &Path,
@@ -330,18 +414,99 @@ pub fn pivot_to_container(rootfs: &Path, permissions: &PermissionConfig) -> Resu
     Ok(())
 }
 
+/// Setup the sudo shim and other host bridge scripts in the container
+/// This must be called AFTER pivot_root when we're inside the container
+pub fn setup_host_bridge_shims(port: u16) -> Result<(), MountError> {
+    // Create /.voidbox/bin for our shims
+    let shim_dir = Path::new("/.voidbox/bin");
+    fs::create_dir_all(shim_dir)?;
+
+    // Create the sudo shim script with full interactive PTY support
+    let sudo_shim = format!(r#"#!/bin/bash
+# VoidBox sudo shim - bridges to host for privileged operations with full PTY
+# Port: {}
+
+PORT={}
+CMD="$*"
+
+# Connect to host bridge
+exec 3<>/dev/tcp/127.0.0.1/$PORT 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "voidbox: Cannot connect to host bridge on port $PORT" >&2
+    exit 1
+fi
+
+# Send the command (protocol: first line is command, then bidirectional I/O)
+echo "SUDO $CMD" >&3
+
+# Forward stdin to socket in background
+cat <&0 >&3 2>/dev/null &
+stdin_pid=$!
+
+# Forward socket to stdout (this blocks until connection closes)
+cat <&3 2>/dev/null
+
+# Cleanup
+kill $stdin_pid 2>/dev/null
+exec 3<&-
+"#, port, port);
+
+    let sudo_path = shim_dir.join("sudo");
+    let mut sudo_file = fs::File::create(&sudo_path)?;
+    sudo_file.write_all(sudo_shim.as_bytes())?;
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&sudo_path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Also create a host-exec shim for running arbitrary commands on host
+    let host_exec_shim = format!(r#"#!/bin/bash
+# VoidBox host-exec - run commands on the host system with full PTY
+PORT={}
+CMD="$*"
+
+exec 3<>/dev/tcp/127.0.0.1/$PORT 2>/dev/null
+if [ $? -ne 0 ]; then
+    echo "voidbox: Cannot connect to host bridge" >&2
+    exit 1
+fi
+
+echo "EXEC $CMD" >&3
+
+cat <&0 >&3 2>/dev/null &
+stdin_pid=$!
+
+cat <&3 2>/dev/null
+
+kill $stdin_pid 2>/dev/null
+exec 3<&-
+"#, port);
+
+    let host_exec_path = shim_dir.join("host-exec");
+    let mut host_exec_file = fs::File::create(&host_exec_path)?;
+    host_exec_file.write_all(host_exec_shim.as_bytes())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&host_exec_path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(())
+}
+
 /// Setup environment variables for container
 pub fn setup_container_env(permissions: &PermissionConfig) {
     unsafe {
-        // In native mode, preserve the host PATH
+        // In native mode, preserve the host PATH but prepend our shim directory
         if permissions.native_mode {
-            // Keep the existing PATH, just ensure it exists
-            if std::env::var("PATH").is_err() {
-                std::env::set_var(
-                    "PATH",
-                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                );
-            }
+            let current_path = std::env::var("PATH")
+                .unwrap_or_else(|_| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
+            // Prepend /.voidbox/bin so our sudo shim takes precedence
+            std::env::set_var("PATH", format!("/.voidbox/bin:{}", current_path));
         } else {
             std::env::set_var(
                 "PATH",

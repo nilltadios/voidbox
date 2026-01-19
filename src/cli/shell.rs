@@ -1,8 +1,11 @@
 //! Shell command implementation
 
-use crate::manifest::parse_manifest_file;
-use crate::runtime::{setup_container_namespaces, setup_user_namespace, spawn_container_init};
+use crate::manifest::{PermissionConfig, parse_manifest_file};
+use crate::runtime::{setup_container_namespaces, setup_user_namespace, spawn_container_init, start_host_bridge};
 use crate::storage::paths;
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{fork, ForkResult};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -21,6 +24,9 @@ pub enum ShellError {
 
     #[error("Shell failed: {0}")]
     Failed(String),
+
+    #[error("Bridge error: {0}")]
+    BridgeError(#[from] crate::runtime::BridgeError),
 }
 
 /// Open a shell in an app's container
@@ -46,16 +52,31 @@ pub fn shell(app_name: &str, dev_mode: bool) -> Result<(), ShellError> {
     println!("[voidbox] Type 'exit' to leave the container.");
     println!();
 
-    // Setup namespaces
-    setup_user_namespace(permissions.native_mode)?;
-    setup_container_namespaces()?;
-
-    // Spawn shell with permissions
-    let self_exe = std::env::current_exe()?;
     let shell = "/bin/bash".to_string();
     let args: Vec<String> = vec![];
 
-    let status = spawn_container_init(&self_exe, &rootfs, &shell, &args, &permissions)
+    // If native_mode, use host bridge
+    if permissions.native_mode {
+        shell_with_host_bridge(&rootfs, &shell, &args, &permissions)?;
+    } else {
+        shell_in_container(&rootfs, &shell, &args, &permissions)?;
+    }
+
+    Ok(())
+}
+
+/// Shell without host bridge (standard container mode)
+fn shell_in_container(
+    rootfs: &Path,
+    shell: &str,
+    args: &[String],
+    permissions: &PermissionConfig,
+) -> Result<(), ShellError> {
+    setup_user_namespace(permissions.native_mode)?;
+    setup_container_namespaces()?;
+
+    let self_exe = std::env::current_exe()?;
+    let status = spawn_container_init(&self_exe, rootfs, shell, args, permissions)
         .map_err(|e| ShellError::Failed(e.to_string()))?;
 
     if !status.success() {
@@ -63,4 +84,54 @@ pub fn shell(app_name: &str, dev_mode: bool) -> Result<(), ShellError> {
     }
 
     Ok(())
+}
+
+/// Shell with host bridge for native mode
+fn shell_with_host_bridge(
+    rootfs: &Path,
+    shell: &str,
+    args: &[String],
+    permissions: &PermissionConfig,
+) -> Result<(), ShellError> {
+    // Start the host bridge BEFORE forking
+    let bridge_handle = start_host_bridge()?;
+    let bridge_port = bridge_handle.port();
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child }) => {
+            let _bridge = bridge_handle;
+            loop {
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => {
+                        std::process::exit(code);
+                    }
+                    Ok(WaitStatus::Signaled(_, sig, _)) => {
+                        std::process::exit(128 + sig as i32);
+                    }
+                    Ok(_) => continue,
+                    Err(nix::errno::Errno::ECHILD) => break,
+                    Err(e) => {
+                        eprintln!("[voidbox] Wait error: {}", e);
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Ok(ForkResult::Child) => {
+            unsafe { std::env::set_var("VOIDBOX_BRIDGE_PORT", bridge_port.to_string()); }
+
+            setup_user_namespace(permissions.native_mode)?;
+            setup_container_namespaces()?;
+
+            let self_exe = std::env::current_exe()?;
+            let status = spawn_container_init(&self_exe, rootfs, shell, args, permissions)
+                .map_err(|e| ShellError::Failed(e.to_string()))?;
+
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        Err(e) => {
+            Err(ShellError::Failed(format!("Fork failed: {}", e)))
+        }
+    }
 }
