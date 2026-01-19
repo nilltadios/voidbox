@@ -64,7 +64,7 @@ A universal Linux application platform that prioritizes portability and usabilit
 
 ---
 
-## Current State (v0.5.0)
+## Current State (v0.6.3)
 
 ### What Works
 
@@ -84,6 +84,7 @@ A universal Linux application platform that prioritizes portability and usabilit
 | Configurable via app.rs | ✅ |
 | Uninstall command | ✅ |
 | Host tool integration (native_mode) | ✅ |
+| Host Bridge (sudo/interactive tools) | ✅ |
 
 ### Current Architecture
 
@@ -1187,6 +1188,12 @@ MIT
 ---
 
 ## Changelog
+
+### v0.6.3
+- **Security:** Implemented shared-secret authentication for host bridge
+- **Feature:** Host bridge support for interactive `sudo` and host commands
+- **Fix:** Preserved system users in container `/etc/passwd` (fixes apt/dbus)
+- **Fix:** Hardened shim scripts against zombie processes
 
 ### v0.6.0 (Current)
 - Added `native_mode` permission for seamless host integration (access host /usr, /lib, tools)
