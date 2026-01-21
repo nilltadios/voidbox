@@ -117,8 +117,9 @@ void_runner (single binary, ~5MB)
 |------------|--------|----------|
 | One binary = one app | Must recompile for each app | Phase 1: Manifest system |
 | No shared base | Each app downloads full Ubuntu (~300MB) | Phase 2: OverlayFS |
-| No app discovery | Users must find manifests manually | Phase 3: Registry |
-| No GUI settings | Terminal only for configuration | Phase 4: Settings app |
+| No app discovery | Users must find manifests manually | Phase 4: Registry |
+| No GUI settings | Terminal only for configuration | Phase 3: Settings app |
+| PATH not always configured | ~/.local/bin not in PATH on some distros | Phase 1: Absolute paths + warning |
 | No home folder access | Container uses /root, not host home | Phase 1: Bind mount home |
 | No host tools | pip/npm/cargo not visible | Phase 1: Bind mount /usr |
 | No theme inheritance | Apps don't match host theme | Phase 1: Bind mount themes |
@@ -576,7 +577,7 @@ voidbox info <app>                  # Show app details
 voidbox search <query>              # Search registry
 
 # Settings
-voidbox settings <app>              # Open GUI settings (Phase 4)
+voidbox settings <app>              # Open GUI settings (Phase 3)
 voidbox settings --cli <app>        # CLI settings editor
 
 # Advanced
@@ -637,7 +638,7 @@ src/
     ├── mod.rs
     ├── defaults.rs         # Default permissions
     ├── override.rs         # User overrides
-    └── gui.rs              # GTK/Qt GUI (Phase 4)
+    └── gui.rs              # GTK/Qt GUI (Phase 3)
 ```
 
 #### 1.4 Deliverables
@@ -653,6 +654,9 @@ src/
 - [x] Home folder bind mount (default ON)
 - [x] Theme/font bind mounts
 - [x] Native GUI Installer (egui) - *Completed ahead of schedule*
+- [ ] Use absolute paths in .desktop files and wrappers (GitHub Issue #1)
+- [ ] Detect missing PATH and warn user with instructions (GitHub Issue #1)
+- [ ] aarch64 (ARM64) support - cross-compile binary + test on ARM hardware
 
 ---
 
@@ -715,13 +719,110 @@ Base Layer (read-only, shared)
 
 ---
 
-### Phase 3: Registry
+### Phase 3: Settings GUI & Native Integration
 
-**Goal**: `voidbox search browser` returns community apps
+**Goal**: Visual permission management + apps feel like native apps
 
 **Duration**: After Phase 2 stable
 
-#### 3.1 Registry Structure
+#### 3.1 GUI Design
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Voidbox Settings                                        [─][□][×]│
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────┐  ┌──────────────────────────────────────────┐ │
+│  │ Installed    │  │                                          │ │
+│  │              │  │  Discord                                 │ │
+│  │ ● Brave      │  │  ──────────────────────────────────────  │ │
+│  │ ● Discord  ◄─┼──│                                          │ │
+│  │ ○ Firefox    │  │  Hardware Access                         │ │
+│  │ ○ VSCode     │  │  ┌────────────────────────────────────┐  │ │
+│  │              │  │  │ [✓] GPU Acceleration               │  │ │
+│  │              │  │  │ [✓] Audio Output                   │  │ │
+│  │              │  │  │ [✓] Microphone                     │  │ │
+│  │              │  │  │ [ ] Camera                         │  │ │
+│  │              │  │  │ [✓] Game Controllers               │  │ │
+│  └──────────────┘  │  └────────────────────────────────────┘  │ │
+│                    │                                          │ │
+│                    │  File Access                             │ │
+│                    │  ┌────────────────────────────────────┐  │ │
+│                    │  │ [✓] Home Folder                    │  │ │
+│                    │  │ [✓] Downloads                      │  │ │
+│                    │  │ [✓] Documents                      │  │ │
+│                    │  │ [ ] External Drives                │  │ │
+│                    │  └────────────────────────────────────┘  │ │
+│                    │                                          │ │
+│                    │  Network                                 │ │
+│                    │  ┌────────────────────────────────────┐  │ │
+│                    │  │ [✓] Internet Access                │  │ │
+│                    │  │ [✓] Local Network                  │  │ │
+│                    │  └────────────────────────────────────┘  │ │
+│                    │                                          │ │
+│                    │  ┌────────────────┐ ┌────────────────┐   │ │
+│                    │  │ Reset Defaults │ │     Apply      │   │ │
+│                    │  └────────────────┘ └────────────────┘   │ │
+│                    │                                          │ │
+│                    └──────────────────────────────────────────┘ │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.2 Technology Options
+
+| Option | Pros | Cons |
+|--------|------|------|
+| GTK4 (gtk4-rs) | Native GNOME look, good Rust bindings | Large dependency |
+| Qt (qmetaobject-rs) | Native KDE look | Complex bindings |
+| egui | Pure Rust, tiny, works everywhere | Non-native look |
+| Tauri/WebView | HTML/CSS flexibility | Web overhead |
+
+**Recommendation**: egui for v1 (simple, no dependencies), GTK4 later
+
+#### 3.3 Native Desktop Integration
+
+Make voidbox apps indistinguishable from native apps:
+
+```bash
+# "Open With" integration - register as handler for file types
+xdg-mime default voidbox-gimp.desktop image/png
+xdg-mime default voidbox-brave.desktop text/html
+
+# Default browser/app registration
+xdg-settings set default-web-browser voidbox-brave.desktop
+
+# URL scheme handlers (discord://, vscode://, etc.)
+xdg-mime default voidbox-discord.desktop x-scheme-handler/discord
+```
+
+**Implementation**:
+- Generate proper MimeType entries in .desktop files
+- Add `voidbox set-default <app>` command for browsers/mail/etc.
+- Support `x-scheme-handler/*` for URL protocols
+- Integrate with xdg-utils for system-wide registration
+
+#### 3.4 Deliverables
+
+- [ ] Settings GUI application
+- [ ] Per-app permission toggles
+- [ ] Reset to defaults button
+- [ ] Launch from `voidbox settings <app>`
+- [ ] System tray integration (optional)
+- [ ] "Open With" support (register as handler for mime-types)
+- [ ] Default browser/app registration (xdg-settings integration)
+- [ ] URL scheme handlers (discord://, vscode://, etc.)
+- [ ] `voidbox set-default <app>` command
+
+---
+
+### Phase 4: Registry
+
+**Goal**: `voidbox search browser` returns community apps
+
+**Duration**: After Phase 3 stable
+
+#### 4.1 Registry Structure
 
 ```
 https://voidbox.dev/
@@ -741,7 +842,7 @@ https://voidbox.dev/
     └── alpine-3.19.tar.zst
 ```
 
-#### 3.2 Registry Index Format
+#### 4.2 Registry Index Format
 
 ```json
 {
@@ -786,7 +887,7 @@ https://voidbox.dev/
 }
 ```
 
-#### 3.3 Decentralization
+#### 4.3 Decentralization
 
 ```bash
 # Users can add multiple registries
@@ -809,7 +910,7 @@ voidbox search browser
 # [gaming-apps.org] chromium - Gaming-optimized Chromium
 ```
 
-#### 3.4 Deliverables
+#### 4.4 Deliverables
 
 - [ ] Registry client (HTTP + JSON parsing)
 - [ ] Local registry cache
@@ -817,77 +918,6 @@ voidbox search browser
 - [ ] Multiple registry support
 - [ ] Registry signature verification (optional)
 - [ ] Static site generator for hosting registry
-
----
-
-### Phase 4: Settings GUI
-
-**Goal**: Visual permission management, no terminal needed
-
-**Duration**: After Phase 3 stable
-
-#### 4.1 GUI Design
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Voidbox Settings                                        [─][□][×]│
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────────────────────────────────┐ │
-│  │ Installed    │  │                                          │ │
-│  │              │  │  Discord                                 │ │
-│  │ ● Brave      │  │  ──────────────────────────────────────  │ │
-│  │ ● Discord  ◄─┼──│                                          │ │
-│  │ ○ Firefox    │  │  Hardware Access                         │ │
-│  │ ○ VSCode     │  │  ┌────────────────────────────────────┐  │ │
-│  │              │  │  │ [✓] GPU Acceleration               │  │ │
-│  │              │  │  │ [✓] Audio Output                   │  │ │
-│  │              │  │  │ [✓] Microphone                     │  │ │
-│  │              │  │  │ [ ] Camera                         │  │ │
-│  │              │  │  │ [✓] Game Controllers               │  │ │
-│  └──────────────┘  │  └────────────────────────────────────┘  │ │
-│                    │                                          │ │
-│                    │  File Access                             │ │
-│                    │  ┌────────────────────────────────────┐  │ │
-│                    │  │ [✓] Home Folder                    │  │ │
-│                    │  │ [✓] Downloads                      │  │ │
-│                    │  │ [✓] Documents                      │  │ │
-│                    │  │ [ ] External Drives                │  │ │
-│                    │  └────────────────────────────────────┘  │ │
-│                    │                                          │ │
-│                    │  Network                                 │ │
-│                    │  ┌────────────────────────────────────┐  │ │
-│                    │  │ [✓] Internet Access                │  │ │
-│                    │  │ [✓] Local Network                  │  │ │
-│                    │  └────────────────────────────────────┘  │ │
-│                    │                                          │ │
-│                    │  ┌────────────────┐ ┌────────────────┐   │ │
-│                    │  │ Reset Defaults │ │     Apply      │   │ │
-│                    │  └────────────────┘ └────────────────┘   │ │
-│                    │                                          │ │
-│                    └──────────────────────────────────────────┘ │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-#### 4.2 Technology Options
-
-| Option | Pros | Cons |
-|--------|------|------|
-| GTK4 (gtk4-rs) | Native GNOME look, good Rust bindings | Large dependency |
-| Qt (qmetaobject-rs) | Native KDE look | Complex bindings |
-| egui | Pure Rust, tiny, works everywhere | Non-native look |
-| Tauri/WebView | HTML/CSS flexibility | Web overhead |
-
-**Recommendation**: egui for v1 (simple, no dependencies), GTK4 later
-
-#### 4.3 Deliverables
-
-- [ ] Settings GUI application
-- [ ] Per-app permission toggles
-- [ ] Reset to defaults button
-- [ ] Launch from `voidbox settings <app>`
-- [ ] System tray integration (optional)
 
 ---
 
@@ -1104,15 +1134,17 @@ voidbox run --profile paranoid discord
 
 ### Phase 3 Success
 
-- [ ] Registry live at voidbox.dev
-- [ ] 20+ community-contributed manifests
-- [ ] Search returns relevant results
-
-### Phase 4 Success
-
 - [ ] GUI settings app works on GNOME/KDE/others
 - [ ] Non-technical users can manage permissions
 - [ ] No terminal needed for basic usage
+- [ ] Apps can be set as default handlers (browser, etc.)
+- [ ] "Open With" works for registered mime-types
+
+### Phase 4 Success
+
+- [ ] Registry live at voidbox.dev
+- [ ] 20+ community-contributed manifests
+- [ ] Search returns relevant results
 
 ### Long-term Success
 
@@ -1143,10 +1175,10 @@ They shouldn't have to. Our manifests point to existing release assets (GitHub r
 
 ### What about ARM64?
 
-Planned for Phase 2+. The architecture supports it; we just need to:
-- Build ARM64 binaries
+Planned for Phase 1. The architecture supports it; we just need to:
+- Build ARM64 binaries (cross-compile with `cargo build --target aarch64-unknown-linux-gnu`)
 - Provide ARM64 base images
-- Test on real hardware
+- Test on real hardware (Raspberry Pi, Apple Silicon via Linux VM, cloud ARM instances)
 
 ### What about Wayland vs X11?
 
