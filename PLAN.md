@@ -802,7 +802,44 @@ xdg-mime default voidbox-discord.desktop x-scheme-handler/discord
 - Support `x-scheme-handler/*` for URL protocols
 - Integrate with xdg-utils for system-wide registration
 
-#### 3.4 Deliverables
+#### 3.4 System D-Bus Integration (VPN Support)
+
+VPN apps require privileged kernel operations (TUN/TAP, routing) that cannot run inside unprivileged user namespaces. Like Flatpak, we support VPN apps by delegating to host system services via D-Bus.
+
+**How it works:**
+```
+┌─────────────────────────────────────┐
+│  VPN App (sandboxed, unprivileged)  │
+│  - GUI for server selection         │
+│  - Downloads VPN configs            │
+└────────────┬────────────────────────┘
+             │ D-Bus (system bus)
+             │ org.freedesktop.NetworkManager
+             ▼
+┌─────────────────────────────────────┐
+│  Host NetworkManager (runs as root) │
+│  - Creates TUN/TAP devices          │
+│  - Manages routes and DNS           │
+│  - Has CAP_NET_ADMIN                │
+└─────────────────────────────────────┘
+```
+
+**Implementation**:
+- Add `system_dbus` permission to manifest schema
+- Bind mount `/run/dbus/system_bus_socket` when enabled
+- Apps can talk to NetworkManager, systemd, polkit, etc.
+
+```toml
+# Example VPN app manifest
+[permissions]
+system_dbus = true  # Access host D-Bus system bus
+```
+
+**Host requirements**:
+- NetworkManager + VPN plugins (openvpn, wireguard)
+- Polkit policies allowing user to manage VPN
+
+#### 3.5 Deliverables
 
 - [ ] Settings GUI application
 - [ ] Per-app permission toggles
@@ -813,6 +850,7 @@ xdg-mime default voidbox-discord.desktop x-scheme-handler/discord
 - [ ] Default browser/app registration (xdg-settings integration)
 - [ ] URL scheme handlers (discord://, vscode://, etc.)
 - [ ] `voidbox set-default <app>` command
+- [ ] `system_dbus` permission for VPN/system service apps
 
 ---
 
@@ -1187,6 +1225,22 @@ Both work. We inherit the host's display server via `$XDG_RUNTIME_DIR` and `$DIS
 ### What about audio?
 
 PulseAudio and PipeWire both work via `$XDG_RUNTIME_DIR/pulse/native` or PipeWire socket.
+
+### What about VPN apps?
+
+VPN apps (NordVPN, ProtonVPN, Mullvad, etc.) require privileged kernel operations (TUN/TAP devices, routing tables) that cannot run inside unprivileged containers. However, like Flatpak, we support VPN apps by delegating to the host's NetworkManager via D-Bus.
+
+**How it works:**
+- VPN app runs sandboxed (GUI, config download, server selection)
+- App talks to host NetworkManager via D-Bus system bus
+- NetworkManager (running as root on host) creates TUN devices and manages routing
+- Requires `system_dbus = true` permission in manifest
+
+**Requirements:**
+- Host must have NetworkManager + VPN plugins installed
+- User must be authorized via polkit to manage VPN connections
+
+**Alternative:** If you just want VPN protection for Voidbox apps, run the VPN on your host system. Since Voidbox shares the host network by default, all containerized apps automatically use the VPN tunnel.
 
 ---
 
