@@ -51,11 +51,14 @@ pub fn create_desktop_entry(manifest: &AppManifest) -> Result<(), DesktopError> 
         format!("MimeType={}\n", manifest.desktop.mime_types.join(";"))
     };
 
+    let exec_path = paths::voidbox_exe_path();
+    let exec_value = exec_path.to_string_lossy();
+
     let content = format!(
         r#"[Desktop Entry]
 Name={}
 Comment={}
-Exec=voidbox run {}
+Exec={} run {}
 Icon={}
 Terminal=false
 Type=Application
@@ -65,6 +68,7 @@ StartupWMClass={}
 "#,
         manifest.app.display_name,
         manifest.app.description,
+        exec_value,
         manifest.app.name,
         icon_value,
         categories,

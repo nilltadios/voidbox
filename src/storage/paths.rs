@@ -14,6 +14,17 @@ pub fn bases_dir() -> PathBuf {
     data_dir().join("bases")
 }
 
+/// Convert a base name + arch to a directory-friendly ID
+pub fn base_id(base: &str, arch: &str) -> String {
+    let sanitized = base.replace(':', "-").replace('/', "-");
+    format!("{}-{}", sanitized, arch)
+}
+
+/// Get the base directory for a specific base + arch
+pub fn base_dir(base: &str, arch: &str) -> PathBuf {
+    bases_dir().join(base_id(base, arch))
+}
+
 /// Get the apps directory (per-app layers)
 pub fn apps_dir() -> PathBuf {
     data_dir().join("apps")
@@ -22,6 +33,11 @@ pub fn apps_dir() -> PathBuf {
 /// Get a specific app's directory
 pub fn app_dir(app_name: &str) -> PathBuf {
     apps_dir().join(app_name)
+}
+
+/// Get app's base info file path
+pub fn app_base_info_path(app_name: &str) -> PathBuf {
+    app_dir(app_name).join("base.json")
 }
 
 /// Get app's layer directory (for OverlayFS upper layer)
@@ -91,6 +107,31 @@ pub fn bin_dir() -> PathBuf {
 /// Get voidbox install path
 pub fn install_path() -> PathBuf {
     bin_dir().join(crate::APP_NAME)
+}
+
+/// Get the best path to the voidbox executable
+pub fn voidbox_exe_path() -> PathBuf {
+    let install_path = install_path();
+    if install_path.exists() {
+        return install_path;
+    }
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from(crate::APP_NAME))
+}
+
+/// Check if ~/.local/bin is in PATH
+pub fn is_bin_dir_in_path() -> bool {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let bin_dir = bin_dir();
+    std::env::split_paths(&path_var).any(|p| paths_match(&p, &bin_dir))
+}
+
+fn paths_match(a: &PathBuf, b: &PathBuf) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_canon = a.canonicalize().unwrap_or_else(|_| a.clone());
+    let b_canon = b.canonicalize().unwrap_or_else(|_| b.clone());
+    a_canon == b_canon
 }
 
 /// Get the installed apps database path

@@ -2,6 +2,7 @@ use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
+use crate::bundle;
 use crate::cli;
 use crate::desktop::install_self;
 use crate::manifest::parse_manifest;
@@ -109,10 +110,17 @@ fn perform_installation(
             install_self()?;
 
             let _ = sender.send(InstallStatus::Progress(1.0, "Done!".to_string()));
-            Ok(format!(
+            let mut message = format!(
                 "Voidbox v{} has been installed successfully!\n\nYou can now use 'voidbox' from your terminal.",
                 crate::VERSION
-            ))
+            );
+            if !paths::is_bin_dir_in_path() {
+                message.push_str(&format!(
+                    "\n\nNote: {} is not in your PATH.\nAdd: export PATH=\"$HOME/.local/bin:$PATH\"",
+                    paths::bin_dir().display()
+                ));
+            }
+            Ok(message)
         }
         InstallType::AppInstall {
             name,
@@ -125,6 +133,7 @@ fn perform_installation(
             ));
 
             // Ensure runtime is installed first
+            let mut runtime_installed = false;
             if !paths::install_path().exists() {
                 let _ = sender.send(InstallStatus::Progress(
                     0.2,
@@ -132,32 +141,62 @@ fn perform_installation(
                 ));
                 paths::ensure_dirs()?;
                 install_self()?;
+                runtime_installed = true;
             }
 
             let _ = sender.send(InstallStatus::Progress(
                 0.3,
                 "Parsing manifest...".to_string(),
             ));
-            let manifest = parse_manifest(&manifest_content)?;
-            let manifest_path = paths::manifest_path(&name);
 
-            // Save manifest
-            paths::ensure_dirs()?;
-            std::fs::write(&manifest_path, manifest_content)?;
+            let bundle_data = bundle::extract_embedded_bundle()?;
+            let installed_name = if let Some(bundle_data) = bundle_data {
+                let manifest = parse_manifest(&bundle_data.manifest_content)?;
+                let installed_name = manifest.app.display_name.clone();
+                let _ = sender.send(InstallStatus::Progress(
+                    0.5,
+                    "Extracting bundle...".to_string(),
+                ));
 
-            // We can't easily get granular progress from the CLI functions yet without refactoring,
-            // so we'll just show indeterminate progress or "Installing..."
-            let _ = sender.send(InstallStatus::Progress(
-                0.5,
-                "Downloading and extracting...".to_string(),
-            ));
+                let install_result = cli::install_app_from_bundle(
+                    &bundle_data.manifest_content,
+                    &bundle_data.archive_path,
+                    &bundle_data.archive_ext,
+                    false,
+                );
+                bundle_data.cleanup();
+                install_result?;
+                installed_name
+            } else {
+                let manifest = parse_manifest(&manifest_content)?;
+                let manifest_path = paths::manifest_path(&name);
 
-            // Install the app
-            // Note: This blocks until done
-            cli::install_app_from_manifest(&manifest, false)?;
+                // Save manifest
+                paths::ensure_dirs()?;
+                std::fs::write(&manifest_path, manifest_content)?;
+
+                // We can't easily get granular progress from the CLI functions yet without refactoring,
+                // so we'll just show indeterminate progress or "Installing..."
+                let _ = sender.send(InstallStatus::Progress(
+                    0.5,
+                    "Downloading and extracting...".to_string(),
+                ));
+
+                // Install the app
+                // Note: This blocks until done
+                cli::install_app_from_manifest(&manifest, false)?;
+                display_name
+            };
 
             let _ = sender.send(InstallStatus::Progress(1.0, "Done!".to_string()));
-            Ok(format!("{} has been installed successfully!", display_name))
+            let mut message = format!("{} has been installed successfully!", installed_name);
+            if runtime_installed && !paths::is_bin_dir_in_path() {
+                message.push_str(&format!(
+                    "\n\nNote: {} is not in your PATH.\nAdd: export PATH=\"$HOME/.local/bin:$PATH\"",
+                    paths::bin_dir().display()
+                ));
+            }
+            Ok(message)
         }
     }
 }

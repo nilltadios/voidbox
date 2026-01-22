@@ -2,10 +2,10 @@
 
 use crate::desktop::{create_app_wrapper, create_desktop_entry, extract_icon};
 use crate::manifest::{
-    AppManifest, ArchiveType, InstalledApp, SourceConfig, parse_manifest_file, parse_manifest_url,
-    validate_manifest,
+    AppManifest, ArchiveType, InstalledApp, SourceConfig, parse_manifest_file, parse_manifest_str,
+    parse_manifest_url, validate_manifest,
 };
-use crate::storage::{download_file, paths};
+use crate::storage::{BaseInfo, download_file, paths, write_base_info};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use std::fs::{self, File};
@@ -21,6 +21,9 @@ pub enum InstallError {
 
     #[error("Download error: {0}")]
     DownloadError(#[from] crate::storage::DownloadError),
+
+    #[error("Base info error: {0}")]
+    BaseInfoError(#[from] crate::storage::BaseInfoError),
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
@@ -92,15 +95,42 @@ pub fn install_app_from_manifest(manifest: &AppManifest, force: bool) -> Result<
         .map_err(|e| InstallError::Failed(format!("Failed to serialize manifest: {}", e)))?;
     fs::write(&manifest_path, manifest_content)?;
 
-    // Download and setup base image
     let rootfs = paths::app_rootfs_dir(app_name);
-    setup_base_image(&rootfs, &manifest)?;
+    let layer_dir = paths::app_layer_dir(app_name);
+    let work_dir = paths::app_work_dir(app_name);
+    let base_info_path = paths::app_base_info_path(app_name);
+
+    let (install_root, base_version) = if rootfs.join("etc/os-release").exists()
+        && !base_info_path.exists()
+    {
+        println!("[voidbox] Existing rootfs detected - using legacy mode.");
+        fs::create_dir_all(&rootfs)?;
+        (rootfs.clone(), None)
+    } else {
+        let arch = detect_ubuntu_arch()?;
+        let base_dir = paths::base_dir(&manifest.runtime.base, &arch);
+        let base_version = setup_base_image(&base_dir, &arch)?;
+
+        write_base_info(
+            app_name,
+            &BaseInfo {
+                base: manifest.runtime.base.clone(),
+                arch: arch.clone(),
+                version: base_version.clone(),
+            },
+        )?;
+
+        fs::create_dir_all(&rootfs)?;
+        fs::create_dir_all(&layer_dir)?;
+        fs::create_dir_all(&work_dir)?;
+        (layer_dir.clone(), Some(base_version))
+    };
 
     // Install dependencies
-    install_dependencies(&rootfs, &manifest)?;
+    install_dependencies(&rootfs, &install_root, &manifest)?;
 
     // Download and install the app (returns actual version downloaded)
-    let actual_version = install_app_binary(&rootfs, &manifest)?;
+    let actual_version = install_app_binary(&install_root, &manifest)?;
 
     // Extract icon
     let icon_filename = manifest.desktop.icon.as_deref();
@@ -119,7 +149,11 @@ pub fn install_app_from_manifest(manifest: &AppManifest, force: bool) -> Result<
     }
 
     // Save installed app info with actual version
-    save_installed_app(&manifest, actual_version.as_deref())?;
+    save_installed_app(
+        &manifest,
+        actual_version.as_deref(),
+        base_version.as_deref(),
+    )?;
 
     println!(
         "[voidbox] Successfully installed {}!",
@@ -130,26 +164,50 @@ pub fn install_app_from_manifest(manifest: &AppManifest, force: bool) -> Result<
     Ok(())
 }
 
-/// Setup base image (Ubuntu) for an app
-fn setup_base_image(rootfs: &Path, _manifest: &AppManifest) -> Result<(), InstallError> {
-    if rootfs.exists() {
+/// Install an app from an embedded bundle (manifest + local archive)
+pub fn install_app_from_bundle(
+    manifest_content: &str,
+    archive_path: &Path,
+    archive_ext: &str,
+    force: bool,
+) -> Result<(), InstallError> {
+    let manifest = parse_manifest_str(manifest_content)?;
+    let mut install_manifest = manifest.clone();
+    install_manifest.source = SourceConfig::Local {
+        path: archive_path.to_path_buf(),
+        archive_type: Some(archive_ext.to_string()),
+    };
+
+    install_app_from_manifest(&install_manifest, force)?;
+
+    // Restore original manifest content (preserves comments/source)
+    let manifest_path = paths::manifest_path(&manifest.app.name);
+    fs::write(&manifest_path, manifest_content)?;
+
+    Ok(())
+}
+
+/// Setup shared base image (Ubuntu)
+fn setup_base_image(base_dir: &Path, arch: &str) -> Result<String, InstallError> {
+    if base_dir.exists() {
         // Check if base is already setup
-        if rootfs.join("etc/os-release").exists() {
+        if base_dir.join("etc/os-release").exists() {
             println!("[voidbox] Base image already exists, skipping...");
-            return Ok(());
+            let existing_version = read_base_version(base_dir).unwrap_or_else(|| "unknown".into());
+            return Ok(existing_version);
         }
-        fs::remove_dir_all(rootfs)?;
+        fs::remove_dir_all(base_dir)?;
     }
 
-    fs::create_dir_all(rootfs)?;
+    fs::create_dir_all(base_dir)?;
 
     println!("[voidbox] Fetching Ubuntu base image...");
 
     // Fetch latest Ubuntu base
-    let (version, url) = fetch_latest_ubuntu_base()?;
+    let (version, url) = fetch_latest_ubuntu_base(arch)?;
     println!("[voidbox] Downloading Ubuntu {} base...", version);
 
-    let archive_path = rootfs.join("ubuntu_base.tar.gz");
+    let archive_path = base_dir.join("ubuntu_base.tar.gz");
     download_file(&url, &archive_path, true)?;
 
     println!("[voidbox] Extracting base image...");
@@ -157,22 +215,22 @@ fn setup_base_image(rootfs: &Path, _manifest: &AppManifest) -> Result<(), Instal
     let decoder = GzDecoder::new(tar_gz);
     let mut archive = tar::Archive::new(decoder);
     archive.set_ignore_zeros(true);
-    archive.unpack(rootfs)?;
+    archive.unpack(base_dir)?;
     fs::remove_file(archive_path)?;
 
     // Setup network
     if Path::new("/etc/resolv.conf").exists() {
-        fs::create_dir_all(rootfs.join("etc"))?;
+        fs::create_dir_all(base_dir.join("etc"))?;
         let content = fs::read_to_string("/etc/resolv.conf")
             .unwrap_or_else(|_| "nameserver 8.8.8.8".to_string());
-        fs::write(rootfs.join("etc/resolv.conf"), content)?;
+        fs::write(base_dir.join("etc/resolv.conf"), content)?;
     }
 
-    Ok(())
+    Ok(version)
 }
 
 /// Fetch latest Ubuntu base image URL
-fn fetch_latest_ubuntu_base() -> Result<(String, String), InstallError> {
+fn fetch_latest_ubuntu_base(arch: &str) -> Result<(String, String), InstallError> {
     let mut resp = ureq::get(crate::UBUNTU_RELEASES_URL)
         .header("User-Agent", crate::APP_NAME)
         .call()
@@ -221,7 +279,7 @@ fn fetch_latest_ubuntu_base() -> Result<(String, String), InstallError> {
             .call()
         {
             if let Ok(body) = resp.body_mut().read_to_string() {
-                let pattern = format!("ubuntu-base-{}-base-amd64.tar.gz", version);
+                let pattern = format!("ubuntu-base-{}-base-{}.tar.gz", version, arch);
                 if body.contains(&pattern) {
                     let download_url = format!("{}{}", release_url, pattern);
                     return Ok((version.clone(), download_url));
@@ -229,7 +287,7 @@ fn fetch_latest_ubuntu_base() -> Result<(String, String), InstallError> {
 
                 // Try base version for point releases
                 let base_version: String = version.split('.').take(2).collect::<Vec<_>>().join(".");
-                let alt_pattern = format!("ubuntu-base-{}-base-amd64.tar.gz", base_version);
+                let alt_pattern = format!("ubuntu-base-{}-base-{}.tar.gz", base_version, arch);
                 if body.contains(&alt_pattern) {
                     let download_url = format!("{}{}", release_url, alt_pattern);
                     return Ok((version.clone(), download_url));
@@ -241,8 +299,34 @@ fn fetch_latest_ubuntu_base() -> Result<(String, String), InstallError> {
     Err(InstallError::Failed("No Ubuntu base image found".into()))
 }
 
+fn read_base_version(base_dir: &Path) -> Option<String> {
+    let os_release = base_dir.join("etc/os-release");
+    let content = fs::read_to_string(os_release).ok()?;
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("VERSION_ID=") {
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+fn detect_ubuntu_arch() -> Result<String, InstallError> {
+    match std::env::consts::ARCH {
+        "x86_64" => Ok("amd64".to_string()),
+        "aarch64" => Ok("arm64".to_string()),
+        other => Err(InstallError::Failed(format!(
+            "Unsupported architecture: {}",
+            other
+        ))),
+    }
+}
+
 /// Install dependencies in the container
-fn install_dependencies(rootfs: &Path, manifest: &AppManifest) -> Result<(), InstallError> {
+fn install_dependencies(
+    rootfs: &Path,
+    layer_dir: &Path,
+    manifest: &AppManifest,
+) -> Result<(), InstallError> {
     if manifest.dependencies.packages.is_empty() {
         return Ok(());
     }
@@ -314,7 +398,7 @@ echo "Setup complete!"
         packages = packages
     );
 
-    let setup_path = rootfs.join("setup.sh");
+    let setup_path = layer_dir.join("setup.sh");
     fs::write(&setup_path, setup_script)?;
 
     #[cfg(unix)]
@@ -373,7 +457,7 @@ fn get_ubuntu_codename(rootfs: &Path) -> String {
 /// Download and install the app binary
 /// Returns the actual version downloaded (if available)
 fn install_app_binary(
-    rootfs: &Path,
+    install_root: &Path,
     manifest: &AppManifest,
 ) -> Result<Option<String>, InstallError> {
     let (version, download_url, override_ext) = match &manifest.source {
@@ -406,23 +490,43 @@ fn install_app_binary(
         SourceConfig::Direct {
             url, archive_type, ..
         } => ("latest".to_string(), url.clone(), archive_type.clone()),
-        SourceConfig::Local { path } => {
-            // Just copy from local path
+        SourceConfig::Local { path, archive_type } => {
+            // Install from local path
             let install_dir = manifest
                 .binary
                 .install_dir
                 .as_deref()
                 .unwrap_or(&manifest.app.name);
-            let target_dir = rootfs.join(format!("opt/{}", install_dir));
+            let target_dir = install_root.join(format!("opt/{}", install_dir));
             fs::create_dir_all(&target_dir)?;
 
             if path.is_dir() {
                 copy_dir_all(path, &target_dir)?;
-            } else {
-                fs::copy(path, target_dir.join(path.file_name().unwrap()))?;
+                create_binary_symlink(install_root, manifest)?;
+                return Ok(None);
             }
 
-            create_binary_symlink(rootfs, manifest)?;
+            let path_str = path.to_string_lossy();
+            let extension = if let Some(ext) = archive_type {
+                if ext.starts_with('.') {
+                    ext.clone()
+                } else {
+                    format!(".{}", ext)
+                }
+            } else {
+                get_extension_from_url(&path_str)
+            };
+
+            if let Some(archive_type) =
+                ArchiveType::from_extension(&extension.trim_start_matches('.'))
+            {
+                extract_archive(archive_type, path, &target_dir)?;
+                create_binary_symlink(install_root, manifest)?;
+                return Ok(None);
+            }
+
+            fs::copy(path, target_dir.join(path.file_name().unwrap()))?;
+            create_binary_symlink(install_root, manifest)?;
             return Ok(None);
         }
     };
@@ -454,73 +558,23 @@ fn install_app_binary(
         get_extension_from_url(&download_url)
     };
 
-    let archive_path = rootfs.join(format!("{}_download{}", install_dir, extension));
+    let archive_path = install_root.join(format!("{}_download{}", install_dir, extension));
 
     download_file(&download_url, &archive_path, true)?;
 
     println!("[voidbox] Extracting...");
-    let target_dir = rootfs.join(format!("opt/{}", install_dir));
+    let target_dir = install_root.join(format!("opt/{}", install_dir));
     fs::create_dir_all(&target_dir)?;
 
     // Extract based on archive type
     let archive_type =
         ArchiveType::from_extension(&extension.trim_start_matches('.')).unwrap_or(ArchiveType::Zip);
-
-    match archive_type {
-        ArchiveType::Zip => {
-            let file = File::open(&archive_path)?;
-            let mut archive = zip::ZipArchive::new(file)
-                .map_err(|e| InstallError::Failed(format!("Failed to open zip: {}", e)))?;
-
-            for i in 0..archive.len() {
-                let mut file = archive.by_index(i).map_err(|e| {
-                    InstallError::Failed(format!("Failed to read zip entry: {}", e))
-                })?;
-
-                let outpath = match file.enclosed_name() {
-                    Some(path) => target_dir.join(path),
-                    None => continue,
-                };
-
-                if file.name().ends_with('/') {
-                    fs::create_dir_all(&outpath)?;
-                } else {
-                    if let Some(p) = outpath.parent() {
-                        if !p.exists() {
-                            fs::create_dir_all(p)?;
-                        }
-                    }
-                    let mut outfile = File::create(&outpath)?;
-                    std::io::copy(&mut file, &mut outfile)?;
-                }
-
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Some(mode) = file.unix_mode() {
-                        fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
-                    }
-                }
-            }
-        }
-        ArchiveType::TarGz => {
-            let file = File::open(&archive_path)?;
-            let decoder = GzDecoder::new(file);
-            let mut archive = tar::Archive::new(decoder);
-            archive.unpack(&target_dir)?;
-        }
-        _ => {
-            return Err(InstallError::Failed(format!(
-                "Unsupported archive type: {}",
-                extension
-            )));
-        }
-    }
+    extract_archive(archive_type, &archive_path, &target_dir)?;
 
     fs::remove_file(archive_path)?;
 
     // Create symlink to binary
-    create_binary_symlink(rootfs, manifest)?;
+    create_binary_symlink(install_root, manifest)?;
 
     Ok(actual_version)
 }
@@ -587,13 +641,70 @@ fn get_extension_from_url(url: &str) -> String {
     }
 }
 
-fn create_binary_symlink(rootfs: &Path, manifest: &AppManifest) -> Result<(), InstallError> {
+fn extract_archive(
+    archive_type: ArchiveType,
+    archive_path: &Path,
+    target_dir: &Path,
+) -> Result<(), InstallError> {
+    match archive_type {
+        ArchiveType::Zip => {
+            let file = File::open(archive_path)?;
+            let mut archive = zip::ZipArchive::new(file)
+                .map_err(|e| InstallError::Failed(format!("Failed to open zip: {}", e)))?;
+
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).map_err(|e| {
+                    InstallError::Failed(format!("Failed to read zip entry: {}", e))
+                })?;
+
+                let outpath = match file.enclosed_name() {
+                    Some(path) => target_dir.join(path),
+                    None => continue,
+                };
+
+                if file.name().ends_with('/') {
+                    fs::create_dir_all(&outpath)?;
+                } else {
+                    if let Some(p) = outpath.parent() {
+                        if !p.exists() {
+                            fs::create_dir_all(p)?;
+                        }
+                    }
+                    let mut outfile = File::create(&outpath)?;
+                    std::io::copy(&mut file, &mut outfile)?;
+                }
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(mode) = file.unix_mode() {
+                        fs::set_permissions(&outpath, fs::Permissions::from_mode(mode))?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        ArchiveType::TarGz => {
+            let file = File::open(archive_path)?;
+            let decoder = GzDecoder::new(file);
+            let mut archive = tar::Archive::new(decoder);
+            archive.unpack(target_dir)?;
+            Ok(())
+        }
+        _ => Err(InstallError::Failed(format!(
+            "Unsupported archive type: {}",
+            archive_type.extension()
+        ))),
+    }
+}
+
+fn create_binary_symlink(install_root: &Path, manifest: &AppManifest) -> Result<(), InstallError> {
     let install_dir = manifest
         .binary
         .install_dir
         .as_deref()
         .unwrap_or(&manifest.app.name);
-    let target_dir = rootfs.join(format!("opt/{}", install_dir));
+    let target_dir = install_root.join(format!("opt/{}", install_dir));
 
     // Find the binary
     let binary_name = &manifest.binary.name;
@@ -631,12 +742,12 @@ fn create_binary_symlink(rootfs: &Path, manifest: &AppManifest) -> Result<(), In
 
     // Create /usr/bin symlink
     let relative_path = binary_path
-        .strip_prefix(rootfs)
+        .strip_prefix(install_root)
         .map_err(|e| InstallError::Failed(format!("Path error: {}", e)))?;
     let container_path = Path::new("/").join(relative_path);
 
-    fs::create_dir_all(rootfs.join("usr/bin"))?;
-    let link_path = rootfs.join(format!("usr/bin/{}", binary_name));
+    fs::create_dir_all(install_root.join("usr/bin"))?;
+    let link_path = install_root.join(format!("usr/bin/{}", binary_name));
 
     if fs::symlink_metadata(&link_path).is_ok() {
         fs::remove_file(&link_path)?;
@@ -664,6 +775,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), InstallError> {
 fn save_installed_app(
     manifest: &AppManifest,
     actual_version: Option<&str>,
+    base_version: Option<&str>,
 ) -> Result<(), InstallError> {
     let db_path = paths::database_path();
 
@@ -687,7 +799,7 @@ fn save_installed_app(
         name: manifest.app.name.clone(),
         display_name: manifest.app.display_name.clone(),
         version,
-        base_version: None,
+        base_version: base_version.map(|v| v.to_string()),
         installed_date: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
         manifest_path: Some(paths::manifest_path(&manifest.app.name)),
     });

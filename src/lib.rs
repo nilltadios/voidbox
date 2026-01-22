@@ -3,6 +3,7 @@
 //! A portable, isolated application environment using Linux user namespaces.
 
 pub mod cli;
+pub mod bundle;
 pub mod desktop;
 pub mod gui;
 pub mod manifest;

@@ -18,11 +18,15 @@ pub fn create_app_wrapper(app_name: &str) -> Result<(), SymlinkError> {
         fs::create_dir_all(parent)?;
     }
 
+    let voidbox_path = paths::voidbox_exe_path();
+    let voidbox_exec = voidbox_path.to_string_lossy();
+
     // Create a shell script that invokes voidbox
     let script = format!(
         r#"#!/bin/sh
-exec voidbox run {} -- "$@"
+exec {} run {} -- "$@"
 "#,
+        voidbox_exec,
         app_name
     );
 

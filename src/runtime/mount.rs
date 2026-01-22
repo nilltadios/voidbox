@@ -1,6 +1,7 @@
 //! Mount operations for container setup
 
 use crate::manifest::PermissionConfig;
+use crate::storage::{paths, read_base_info_for_rootfs};
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::unistd::{chdir, pivot_root, sethostname};
 use std::fs;
@@ -226,6 +227,62 @@ pub fn get_bind_mounts(permissions: &PermissionConfig) -> Vec<BindMount> {
     mounts
 }
 
+fn try_mount_overlay(rootfs: &Path) -> Result<bool, MountError> {
+    let Some(info) = read_base_info_for_rootfs(rootfs)
+        .map_err(|e| MountError::MountFailed(format!("base info: {}", e)))?
+    else {
+        return Ok(false);
+    };
+
+    let base_dir = paths::base_dir(&info.base, &info.arch);
+    if !base_dir.exists() {
+        return Err(MountError::MountFailed(format!(
+            "base image missing: {}",
+            base_dir.display()
+        )));
+    }
+
+    let app_dir = rootfs.parent().ok_or_else(|| {
+        MountError::MountFailed(format!("invalid rootfs path: {}", rootfs.display()))
+    })?;
+    let layer_dir = app_dir.join("layer");
+    let work_dir = app_dir.join("work");
+
+    fs::create_dir_all(&layer_dir)?;
+    fs::create_dir_all(&work_dir)?;
+
+    let base_opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        base_dir.display(),
+        layer_dir.display(),
+        work_dir.display()
+    );
+    let opts_with_xattr = format!("{},userxattr", base_opts);
+
+    if mount(
+        Some("overlay"),
+        rootfs,
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(opts_with_xattr.as_str()),
+    )
+    .is_ok()
+    {
+        return Ok(true);
+    }
+
+    mount(
+        Some("overlay"),
+        rootfs,
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(base_opts.as_str()),
+    )
+    .map_err(|e| MountError::MountFailed(format!("overlay mount failed: {}", e)))?;
+
+    Ok(true)
+}
+
 /// Generate synthetic /etc/passwd content that preserves system users but maps UID 0 to host username
 fn generate_passwd_content(rootfs: &Path) -> Result<String, std::io::Error> {
     let mut content = String::new();
@@ -355,6 +412,8 @@ pub fn setup_container_mounts(
     rootfs: &Path,
     permissions: &PermissionConfig,
 ) -> Result<(), MountError> {
+    fs::create_dir_all(rootfs)?;
+
     // Make root private
     mount(
         None::<&str>,
@@ -365,15 +424,18 @@ pub fn setup_container_mounts(
     )
     .map_err(|e| MountError::MountFailed(format!("make root private: {}", e)))?;
 
-    // Bind mount rootfs to itself
-    mount(
-        Some(rootfs),
-        rootfs,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(|e| MountError::MountFailed(format!("bind rootfs: {}", e)))?;
+    // Try to mount overlay (shared base + per-app layer)
+    if !try_mount_overlay(rootfs)? {
+        // Fallback: bind mount rootfs to itself (legacy mode)
+        mount(
+            Some(rootfs),
+            rootfs,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| MountError::MountFailed(format!("bind rootfs: {}", e)))?;
+    }
 
     chdir(rootfs).map_err(|e| MountError::MountFailed(format!("chdir to rootfs: {}", e)))?;
 

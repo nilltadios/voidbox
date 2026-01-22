@@ -58,7 +58,11 @@ pub enum SourceConfig {
     },
 
     /// Local file path (for testing)
-    Local { path: PathBuf },
+    Local {
+        path: PathBuf,
+        #[serde(default)]
+        archive_type: Option<String>,
+    },
 }
 
 fn default_linux() -> String {
@@ -66,7 +70,11 @@ fn default_linux() -> String {
 }
 
 fn default_arch() -> String {
-    "amd64".to_string()
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        _ => "amd64".to_string(),
+    }
 }
 
 /// Runtime configuration
@@ -86,7 +94,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             base: default_base(),
-            arch: vec!["x86_64".to_string()],
+            arch: vec!["x86_64".to_string(), "aarch64".to_string()],
         }
     }
 }

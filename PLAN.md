@@ -11,7 +11,7 @@ A universal Linux application platform that prioritizes portability and usabilit
 ## Table of Contents
 
 1. [Philosophy](#philosophy)
-2. [Current State (v0.5.0)](#current-state-v050)
+2. [Current State (v0.7.0)](#current-state-v070)
 3. [Competitor Analysis](#competitor-analysis)
 4. [Target Users](#target-users)
 5. [Architecture](#architecture)
@@ -64,7 +64,7 @@ A universal Linux application platform that prioritizes portability and usabilit
 
 ---
 
-## Current State (v0.6.3)
+## Current State (v0.7.0)
 
 ### What Works
 
@@ -75,13 +75,15 @@ A universal Linux application platform that prioritizes portability and usabilit
 | No daemon required | ✅ |
 | Auto-install to ~/.local/bin | ✅ |
 | Desktop launcher creation | ✅ |
+| Shared base images (OverlayFS) | ✅ |
+| .voidbox self-extracting installers | ✅ |
 | Auto-update (self) | ✅ |
 | Auto-update (target app) | ✅ |
 | GPU passthrough | ✅ |
 | Audio passthrough (PulseAudio/PipeWire) | ✅ |
 | Wayland/X11 support | ✅ |
 | Offline launch (if update fails) | ✅ |
-| Configurable via app.rs | ✅ |
+| Manifest-driven installs | ✅ |
 | Uninstall command | ✅ |
 | Host tool integration (native_mode) | ✅ |
 | Host Bridge (sudo/interactive tools) | ✅ |
@@ -89,7 +91,7 @@ A universal Linux application platform that prioritizes portability and usabilit
 ### Current Architecture
 
 ```
-void_runner (single binary, ~5MB)
+voidbox (single binary, ~5MB)
          │
          ▼
 ┌─────────────────────────────────────────┐
@@ -103,11 +105,15 @@ void_runner (single binary, ~5MB)
          │
          ▼
 ┌─────────────────────────────────────────┐
-│    ~/.local/share/void_runner/          │
-│    ├── rootfs/        (Ubuntu base)     │
-│    │   └── opt/brave/ (target app)      │
-│    ├── installed.json (version info)    │
-│    └── void_runner.png (icon)           │
+│    ~/.local/share/voidbox/              │
+│    ├── bases/ubuntu-24.04-amd64/         │
+│    ├── apps/brave/                       │
+│    │   ├── base.json                     │
+│    │   ├── layer/                        │
+│    │   ├── work/                         │
+│    │   └── rootfs/ (overlay mount)       │
+│    ├── manifests/brave.toml              │
+│    └── installed.json (version info)     │
 └─────────────────────────────────────────┘
 ```
 
@@ -115,14 +121,10 @@ void_runner (single binary, ~5MB)
 
 | Limitation | Impact | Solution |
 |------------|--------|----------|
-| One binary = one app | Must recompile for each app | Phase 1: Manifest system |
-| No shared base | Each app downloads full Ubuntu (~300MB) | Phase 2: OverlayFS |
 | No app discovery | Users must find manifests manually | Phase 4: Registry |
 | No GUI settings | Terminal only for configuration | Phase 3: Settings app |
-| PATH not always configured | ~/.local/bin not in PATH on some distros | Phase 1: Absolute paths + warning |
-| No home folder access | Container uses /root, not host home | Phase 1: Bind mount home |
-| No host tools | pip/npm/cargo not visible | Phase 1: Bind mount /usr |
-| No theme inheritance | Apps don't match host theme | Phase 1: Bind mount themes |
+| No bundle signing | Users must trust the source | Phase 3: Signatures |
+| Limited arm64 manifests | Some apps only ship x86_64 | Phase 2: Dual-arch bundles |
 
 ---
 
@@ -654,8 +656,8 @@ src/
 - [x] Home folder bind mount (default ON)
 - [x] Theme/font bind mounts
 - [x] Native GUI Installer (egui) - *Completed ahead of schedule*
-- [ ] Use absolute paths in .desktop files and wrappers (GitHub Issue #1)
-- [ ] Detect missing PATH and warn user with instructions (GitHub Issue #1)
+- [x] Use absolute paths in .desktop files and wrappers (GitHub Issue #1)
+- [x] Detect missing PATH and warn user with instructions (GitHub Issue #1)
 - [ ] aarch64 (ARM64) support - cross-compile binary + test on ARM hardware
 
 ---
@@ -709,13 +711,51 @@ Base Layer (read-only, shared)
 | `alpine:3.19` | ~3MB | ~8MB | Minimal, static binaries |
 | `fedora:40` | ~50MB | ~400MB | RPM-based apps (future) |
 
-#### 2.3 Deliverables
+#### 2.3 System D-Bus Integration (VPN Support)
 
-- [ ] OverlayFS mounting in user namespace
-- [ ] Base image download and extraction
-- [ ] Base image sharing between apps
-- [ ] Lazy base download (on first app install)
+VPN apps require privileged kernel operations (TUN/TAP, routing) that cannot run inside unprivileged user namespaces. Like Flatpak, we support VPN apps by delegating to host system services via D-Bus.
+
+**How it works:**
+```
+┌─────────────────────────────────────┐
+│  VPN App (sandboxed, unprivileged)  │
+│  - GUI for server selection         │
+│  - Downloads VPN configs            │
+└────────────┬────────────────────────┘
+             │ D-Bus (system bus)
+             │ org.freedesktop.NetworkManager
+             ▼
+┌─────────────────────────────────────┐
+│  Host NetworkManager (runs as root) │
+│  - Creates TUN/TAP devices          │
+│  - Manages routes and DNS           │
+│  - Has CAP_NET_ADMIN                │
+└─────────────────────────────────────┘
+```
+
+**Implementation**:
+- Add `system_dbus` permission to manifest schema
+- Bind mount `/run/dbus/system_bus_socket` when enabled
+- Apps can talk to NetworkManager, systemd, polkit, etc.
+
+```toml
+# Example VPN app manifest
+[permissions]
+system_dbus = true  # Access host D-Bus system bus
+```
+
+**Host requirements**:
+- NetworkManager + VPN plugins (openvpn, wireguard)
+- Polkit policies allowing user to manage VPN
+
+#### 2.4 Deliverables
+
+- [x] OverlayFS mounting in user namespace
+- [x] Base image download and extraction
+- [x] Base image sharing between apps
+- [x] Lazy base download (on first app install)
 - [ ] Base image updates
+- [ ] `system_dbus` permission for VPN/system service apps
 
 ---
 
@@ -802,44 +842,7 @@ xdg-mime default voidbox-discord.desktop x-scheme-handler/discord
 - Support `x-scheme-handler/*` for URL protocols
 - Integrate with xdg-utils for system-wide registration
 
-#### 3.4 System D-Bus Integration (VPN Support)
-
-VPN apps require privileged kernel operations (TUN/TAP, routing) that cannot run inside unprivileged user namespaces. Like Flatpak, we support VPN apps by delegating to host system services via D-Bus.
-
-**How it works:**
-```
-┌─────────────────────────────────────┐
-│  VPN App (sandboxed, unprivileged)  │
-│  - GUI for server selection         │
-│  - Downloads VPN configs            │
-└────────────┬────────────────────────┘
-             │ D-Bus (system bus)
-             │ org.freedesktop.NetworkManager
-             ▼
-┌─────────────────────────────────────┐
-│  Host NetworkManager (runs as root) │
-│  - Creates TUN/TAP devices          │
-│  - Manages routes and DNS           │
-│  - Has CAP_NET_ADMIN                │
-└─────────────────────────────────────┘
-```
-
-**Implementation**:
-- Add `system_dbus` permission to manifest schema
-- Bind mount `/run/dbus/system_bus_socket` when enabled
-- Apps can talk to NetworkManager, systemd, polkit, etc.
-
-```toml
-# Example VPN app manifest
-[permissions]
-system_dbus = true  # Access host D-Bus system bus
-```
-
-**Host requirements**:
-- NetworkManager + VPN plugins (openvpn, wireguard)
-- Polkit policies allowing user to manage VPN
-
-#### 3.5 Deliverables
+#### 3.4 Deliverables
 
 - [ ] Settings GUI application
 - [ ] Per-app permission toggles
@@ -850,7 +853,6 @@ system_dbus = true  # Access host D-Bus system bus
 - [ ] Default browser/app registration (xdg-settings integration)
 - [ ] URL scheme handlers (discord://, vscode://, etc.)
 - [ ] `voidbox set-default <app>` command
-- [ ] `system_dbus` permission for VPN/system service apps
 
 ---
 
@@ -1275,13 +1277,19 @@ MIT
 
 ## Changelog
 
+### v0.7.0
+- **Feature:** Shared base images via OverlayFS with per-app layers
+- **Feature:** Self-extracting `.voidbox` installers (CLI + GUI)
+- **Fix:** Desktop launchers and wrappers use absolute voidbox path
+- **Fix:** Robust binary resolution for overlay installs
+
 ### v0.6.3
 - **Security:** Implemented shared-secret authentication for host bridge
 - **Feature:** Host bridge support for interactive `sudo` and host commands
 - **Fix:** Preserved system users in container `/etc/passwd` (fixes apt/dbus)
 - **Fix:** Hardened shim scripts against zombie processes
 
-### v0.6.0 (Current)
+### v0.6.0
 - Added `native_mode` permission for seamless host integration (access host /usr, /lib, tools)
 - Fixed binary execution path resolution for native applications
 - Improved DNS resolution in container environments

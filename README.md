@@ -6,7 +6,9 @@
 
 - **Single Binary**: No external dependencies (no Docker, Podman, or Flatpak required)
 - **Multi-App Support**: Install any app using TOML manifests
+- **Shared Base Images**: OverlayFS base + per-app layers
 - **Auto-Install**: First run installs to `~/.local/bin` and creates desktop launchers
+- **.voidbox Installers**: Self-extracting, double-clickable single-file apps
 - **Auto-Update**: Automatically updates apps and voidbox itself
 - **Portable**: Works on Fedora, Ubuntu, Debian, Arch, and more
 - **Isolated**: Runs in dedicated User/Mount/PID namespaces
@@ -32,6 +34,24 @@ voidbox run brave
 voidbox list
 ```
 
+## .voidbox Installers (Single-File Apps)
+
+Create a self-extracting `.voidbox` installer that works like a Linux `.exe`:
+
+```bash
+voidbox bundle create ./myapp.toml ./myapp.zip --output MyApp.voidbox
+chmod +x MyApp.voidbox
+./MyApp.voidbox
+```
+
+Double-clicking `MyApp.voidbox` opens a GUI installer and requires no terminal.
+
+You can also install from an existing file:
+
+```bash
+voidbox bundle install ./MyApp.voidbox
+```
+
 ## Commands
 
 ```
@@ -50,6 +70,8 @@ voidbox info                 # Show voidbox info
 voidbox info <app>           # Show app details
 voidbox uninstall            # Remove voidbox (keeps app data)
 voidbox uninstall --purge    # Remove voidbox and all data
+voidbox bundle create <manifest> <archive>   # Create a .voidbox installer
+voidbox bundle install <bundle.voidbox>      # Install from a .voidbox file
 ```
 
 ## Manifest Format
@@ -106,10 +128,10 @@ cargo build --release
 ## How it Works
 
 1. Parses the app manifest to get download URL and dependencies
-2. Downloads a minimal Ubuntu base rootfs (~30MB compressed)
+2. Downloads a shared Ubuntu base rootfs (once per base + arch)
 3. Sets up Linux namespaces (user, mount, PID, UTS, IPC)
-4. Installs app dependencies inside the isolated environment
-5. Downloads and extracts the target application
+4. Creates a per-app overlay layer and installs dependencies
+5. Downloads and extracts the target application into the layer
 6. Bind-mounts host hardware interfaces (GPU, audio, Wayland/X11)
 7. Bind-mounts home folder, fonts, themes (based on permissions)
 8. Launches the app in the isolated container
@@ -118,9 +140,14 @@ cargo build --release
 
 ```
 ~/.local/share/voidbox/
+├── bases/                   # Shared base images
+│   └── ubuntu-24.04-amd64/
 ├── apps/                    # Per-app installations
 │   └── brave/
-│       └── rootfs/          # App's root filesystem
+│       ├── base.json        # Base metadata
+│       ├── layer/           # App layer (upperdir)
+│       ├── work/            # Overlay workdir
+│       └── rootfs/          # Overlay mountpoint
 ├── manifests/               # Saved app manifests
 │   └── brave.toml
 ├── settings/                # User permission overrides

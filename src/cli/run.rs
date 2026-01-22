@@ -9,6 +9,7 @@ use crate::storage::paths;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, fork};
 use std::path::Path;
+use std::fs;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -53,7 +54,11 @@ pub fn run_app(
 
     let rootfs = paths::app_rootfs_dir(app_name);
     if !rootfs.exists() {
-        return Err(RunError::NotInstalled(app_name.to_string()));
+        if paths::app_layer_dir(app_name).exists() {
+            fs::create_dir_all(&rootfs)?;
+        } else {
+            return Err(RunError::NotInstalled(app_name.to_string()));
+        }
     }
 
     // Load manifest
@@ -180,18 +185,8 @@ fn build_command(
 
     // Resolve the actual binary path by reading the symlink created during install
     // This is required for native_mode where /usr/bin is masked by the host
-    let symlink_path = rootfs.join("usr/bin").join(binary_name);
-
-    // Use symlink_metadata to check existence of the link itself, not the target
-    // (since target is absolute path inside container, it won't exist on host)
-    let cmd = if std::fs::symlink_metadata(&symlink_path).is_ok() {
-        match std::fs::read_link(&symlink_path) {
-            Ok(target) => target.to_string_lossy().into_owned(),
-            Err(_) => format!("/usr/bin/{}", binary_name),
-        }
-    } else {
-        format!("/usr/bin/{}", binary_name)
-    };
+    let cmd = resolve_binary_symlink(rootfs, binary_name)
+        .unwrap_or_else(|| format!("/usr/bin/{}", binary_name));
 
     let mut cmd_args: Vec<String> = manifest.binary.args.clone();
 
@@ -201,6 +196,25 @@ fn build_command(
     }
 
     Ok((cmd, cmd_args))
+}
+
+fn resolve_binary_symlink(rootfs: &Path, binary_name: &str) -> Option<String> {
+    let symlink_path = rootfs.join("usr/bin").join(binary_name);
+    if std::fs::symlink_metadata(&symlink_path).is_ok() {
+        if let Ok(target) = std::fs::read_link(&symlink_path) {
+            return Some(target.to_string_lossy().into_owned());
+        }
+    }
+
+    let app_dir = rootfs.parent()?;
+    let layer_symlink = app_dir.join("layer/usr/bin").join(binary_name);
+    if std::fs::symlink_metadata(&layer_symlink).is_ok() {
+        if let Ok(target) = std::fs::read_link(&layer_symlink) {
+            return Some(target.to_string_lossy().into_owned());
+        }
+    }
+
+    None
 }
 
 /// Internal init function - called after fork in new namespace

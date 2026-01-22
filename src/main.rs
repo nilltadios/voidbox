@@ -10,6 +10,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use voidbox::bundle;
 use voidbox::cli;
 use voidbox::desktop::install_self;
 use voidbox::gui;
@@ -111,6 +112,12 @@ enum Commands {
         purge: bool,
     },
 
+    /// Bundle commands (.voidbox installers)
+    Bundle {
+        #[command(subcommand)]
+        command: BundleCommands,
+    },
+
     /// Internal initialization command (do not use manually)
     #[command(hide = true)]
     InternalInit {
@@ -133,6 +140,32 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum BundleCommands {
+    /// Create a self-extracting .voidbox installer
+    Create {
+        /// Manifest TOML file
+        manifest: PathBuf,
+
+        /// App archive file (zip/tar.gz)
+        archive: PathBuf,
+
+        /// Output .voidbox file
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+    },
+
+    /// Install from a .voidbox file
+    Install {
+        /// Bundle file path
+        bundle: PathBuf,
+
+        /// Run the app after install
+        #[arg(long)]
+        run: bool,
+    },
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check if we're running as a launcher (void_brave, void_discord, etc.)
     // This uses argv[0] detection similar to busybox
@@ -140,10 +173,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_as_launcher(&app_name);
     }
 
-    // Check if we're being double-clicked (no args, not a TTY)
+    // Check for embedded bundle or GUI installer
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 1 && gui::is_gui_mode() {
-        return gui_install_mode();
+    if args.len() == 1 {
+        let current_exe = std::env::current_exe().unwrap_or_default();
+        let is_installed_exe = current_exe == paths::install_path();
+
+        if !is_installed_exe {
+            if let Some(info) = bundle::embedded_manifest_info()? {
+                if gui::is_gui_mode() {
+                    return gui_bundle_install_mode(info);
+                }
+                return cli_bundle_install_mode(info);
+            }
+        }
+
+        // Check if we're being double-clicked (no args, not a TTY)
+        if gui::is_gui_mode() {
+            return gui_install_mode();
+        }
     }
 
     let cli = Cli::parse();
@@ -161,6 +209,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !voidbox::desktop::is_installed() {
             if let Err(e) = install_self() {
                 eprintln!("[voidbox] Warning: Self-installation failed: {}", e);
+            } else if !paths::is_bin_dir_in_path() {
+                eprintln!(
+                    "[voidbox] Warning: {} is not in your PATH.",
+                    paths::bin_dir().display()
+                );
+                eprintln!(
+                    "[voidbox] Add this to your shell config: export PATH=\"$HOME/.local/bin:$PATH\""
+                );
             }
         }
     }
@@ -208,6 +264,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Uninstall { purge } => {
             uninstall_voidbox(purge)?;
         }
+
+        Commands::Bundle { command } => match command {
+            BundleCommands::Create {
+                manifest,
+                archive,
+                output,
+            } => {
+                cli::bundle_create(&manifest, &archive, output.as_deref())?;
+            }
+            BundleCommands::Install { bundle, run } => {
+                cli::bundle_install(&bundle, run)?;
+            }
+        },
 
         Commands::InternalInit {
             rootfs,
@@ -257,6 +326,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn uninstall_voidbox(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use voidbox::manifest::InstalledApp;
+
     if purge {
         println!("[voidbox] This will remove voidbox and ALL app data.");
     } else {
@@ -280,6 +351,49 @@ fn uninstall_voidbox(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     if install_path.exists() {
         std::fs::remove_file(&install_path)?;
         println!("  Removed {}", install_path.display());
+    }
+
+    // Remove app wrappers and launcher symlinks
+    let mut installed_apps: Vec<String> = Vec::new();
+    let db_path = paths::database_path();
+    if db_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&db_path) {
+            if let Ok(apps) = serde_json::from_str::<Vec<InstalledApp>>(&content) {
+                installed_apps = apps.into_iter().map(|a| a.name).collect();
+            }
+        }
+    }
+
+    let bin_dir = paths::bin_dir();
+    for app_name in installed_apps {
+        let wrapper_path = bin_dir.join(&app_name);
+        if wrapper_path.exists() {
+            std::fs::remove_file(&wrapper_path)?;
+            println!("  Removed {}", wrapper_path.display());
+        }
+        let launcher_path = bin_dir.join(format!("void_{}", app_name));
+        if launcher_path.exists() {
+            std::fs::remove_file(&launcher_path)?;
+            println!("  Removed {}", launcher_path.display());
+        }
+    }
+
+    if bin_dir.exists() {
+        for entry in std::fs::read_dir(&bin_dir)? {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if let Ok(meta) = entry.file_type() {
+                    if meta.is_symlink() {
+                        if let Ok(target) = std::fs::read_link(&path) {
+                            if target.file_name().is_some_and(|n| n == "voidbox") {
+                                std::fs::remove_file(&path)?;
+                                println!("  Removed {}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Remove all desktop entries
@@ -361,5 +475,58 @@ fn gui_install_mode() -> Result<(), Box<dyn std::error::Error>> {
         println!("Falling back to terminal mode...");
     }
 
+    Ok(())
+}
+
+fn gui_bundle_install_mode(
+    info: bundle::BundleManifestInfo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use voidbox::gui::{InstallType, run_installer};
+
+    if let Err(e) = run_installer(InstallType::AppInstall {
+        name: info.app_name,
+        display_name: info.display_name,
+        manifest_content: info.manifest_content,
+    }) {
+        eprintln!("GUI Error: {}", e);
+    }
+
+    Ok(())
+}
+
+fn cli_bundle_install_mode(
+    info: bundle::BundleManifestInfo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use voidbox::storage::paths;
+
+    if !voidbox::desktop::is_installed() {
+        install_self()?;
+        if !paths::is_bin_dir_in_path() {
+            eprintln!(
+                "[voidbox] Warning: {} is not in your PATH.",
+                paths::bin_dir().display()
+            );
+            eprintln!(
+                "[voidbox] Add this to your shell config: export PATH=\"$HOME/.local/bin:$PATH\""
+            );
+        }
+    }
+
+    println!("[voidbox] Installing {}...", info.display_name);
+    let bundle_data = bundle::extract_embedded_bundle()?.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "Bundle data missing")
+    })?;
+    let install_result = cli::install_app_from_bundle(
+        &bundle_data.manifest_content,
+        &bundle_data.archive_path,
+        &bundle_data.archive_ext,
+        false,
+    );
+    bundle_data.cleanup();
+    install_result?;
+    println!(
+        "[voidbox] {} installed. Run with: voidbox run {}",
+        info.display_name, info.app_name
+    );
     Ok(())
 }

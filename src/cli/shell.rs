@@ -40,7 +40,11 @@ pub fn shell(app_name: &str, dev_mode: bool) -> Result<(), ShellError> {
 
     let rootfs = paths::app_rootfs_dir(app_name);
     if !rootfs.exists() {
-        return Err(ShellError::NotInstalled(app_name.to_string()));
+        if paths::app_layer_dir(app_name).exists() {
+            std::fs::create_dir_all(&rootfs)?;
+        } else {
+            return Err(ShellError::NotInstalled(app_name.to_string()));
+        }
     }
 
     // Load manifest for permissions

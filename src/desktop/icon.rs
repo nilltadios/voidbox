@@ -17,7 +17,9 @@ pub enum IconError {
 
 /// Extract icon from app installation directory
 pub fn extract_icon(app_name: &str, icon_path: Option<&str>) -> Result<(), IconError> {
-    let app_rootfs = paths::app_rootfs_dir(app_name);
+    let layer_dir = paths::app_layer_dir(app_name);
+    let rootfs_dir = paths::app_rootfs_dir(app_name);
+    let app_rootfs = if layer_dir.exists() { layer_dir } else { rootfs_dir };
     let icon_dest = paths::app_icon_path(app_name);
 
     if let Some(parent) = icon_dest.parent() {

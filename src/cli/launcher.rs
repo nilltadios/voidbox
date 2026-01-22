@@ -134,6 +134,7 @@ pub fn should_run_as_launcher() -> Option<String> {
             "list",
             "info",
             "shell",
+            "bundle",
             "search",
             "settings",
             "self-update",
@@ -171,7 +172,7 @@ pub fn run_launcher(app_name: &str) -> Result<(), LauncherError> {
 
     // Check if app is installed
     let manifest_path = paths::manifest_path(app_name);
-    let app_installed = manifest_path.exists() && paths::app_rootfs_dir(app_name).exists();
+    let app_installed = manifest_path.exists() && paths::app_layer_dir(app_name).exists();
 
     if !app_installed {
         // App not installed - install it
