@@ -5,9 +5,12 @@ use crate::manifest::{
     AppManifest, ArchiveType, InstalledApp, SourceConfig, parse_manifest_file, parse_manifest_str,
     parse_manifest_url, validate_manifest,
 };
-use crate::storage::{BaseInfo, download_file, paths, write_base_info};
+use crate::storage::{
+    BaseInfo, download_file, download_string, paths, write_base_info, write_base_info_for_dir,
+};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
+use serde_json::Value;
 use std::fs::{self, File};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -99,6 +102,8 @@ pub fn install_app_from_manifest(manifest: &AppManifest, force: bool) -> Result<
     let layer_dir = paths::app_layer_dir(app_name);
     let work_dir = paths::app_work_dir(app_name);
     let base_info_path = paths::app_base_info_path(app_name);
+    let shared_packages = &manifest.dependencies.shared;
+    let app_packages = &manifest.dependencies.packages;
 
     let (install_root, base_version) = if rootfs.join("etc/os-release").exists()
         && !base_info_path.exists()
@@ -111,12 +116,15 @@ pub fn install_app_from_manifest(manifest: &AppManifest, force: bool) -> Result<
         let base_dir = paths::base_dir(&manifest.runtime.base, &arch);
         let base_version = setup_base_image(&base_dir, &arch)?;
 
+        let deps_id = ensure_deps_layer(&manifest, &arch, &base_version)?;
+
         write_base_info(
             app_name,
             &BaseInfo {
                 base: manifest.runtime.base.clone(),
                 arch: arch.clone(),
                 version: base_version.clone(),
+                deps_id: deps_id.clone(),
             },
         )?;
 
@@ -127,7 +135,13 @@ pub fn install_app_from_manifest(manifest: &AppManifest, force: bool) -> Result<
     };
 
     // Install dependencies
-    install_dependencies(&rootfs, &install_root, &manifest)?;
+    if base_version.is_none() {
+        let mut legacy_packages = shared_packages.clone();
+        legacy_packages.extend(app_packages.iter().cloned());
+        install_dependencies(&rootfs, &install_root, &legacy_packages)?;
+    } else if !app_packages.is_empty() {
+        install_dependencies(&rootfs, &install_root, app_packages)?;
+    }
 
     // Download and install the app (returns actual version downloaded)
     let actual_version = install_app_binary(&install_root, &manifest)?;
@@ -173,6 +187,16 @@ pub fn install_app_from_bundle(
 ) -> Result<(), InstallError> {
     let manifest = parse_manifest_str(manifest_content)?;
     let mut install_manifest = manifest.clone();
+    if install_manifest.app.version.is_none() {
+        match resolve_bundle_version(&manifest) {
+            Ok(Some(version)) => install_manifest.app.version = Some(version),
+            Ok(None) => {}
+            Err(e) => println!(
+                "[voidbox] Warning: Could not determine app version for bundle: {}",
+                e
+            ),
+        }
+    }
     install_manifest.source = SourceConfig::Local {
         path: archive_path.to_path_buf(),
         archive_type: Some(archive_ext.to_string()),
@@ -325,9 +349,9 @@ fn detect_ubuntu_arch() -> Result<String, InstallError> {
 fn install_dependencies(
     rootfs: &Path,
     layer_dir: &Path,
-    manifest: &AppManifest,
+    packages: &[String],
 ) -> Result<(), InstallError> {
-    if manifest.dependencies.packages.is_empty() {
+    if packages.is_empty() {
         return Ok(());
     }
 
@@ -335,7 +359,7 @@ fn install_dependencies(
 
     // Get Ubuntu codename
     let _codename = get_ubuntu_codename(rootfs);
-    let packages = manifest.dependencies.packages.join(" ");
+    let packages = packages.join(" ");
 
     let setup_script = format!(
         r#"#!/bin/bash
@@ -439,6 +463,56 @@ echo "Setup complete!"
     Ok(())
 }
 
+fn ensure_deps_layer(
+    manifest: &AppManifest,
+    arch: &str,
+    base_version: &str,
+) -> Result<Option<String>, InstallError> {
+    if manifest.dependencies.shared.is_empty() {
+        return Ok(None);
+    }
+
+    let deps_id = paths::deps_id(
+        &manifest.runtime.base,
+        arch,
+        &manifest.dependencies.shared,
+    );
+    let deps_dir = paths::deps_dir().join(&deps_id);
+    let deps_rootfs = paths::deps_rootfs_dir(&deps_id);
+    let deps_layer = paths::deps_layer_dir(&deps_id);
+    let deps_work = paths::deps_work_dir(&deps_id);
+    let deps_ready = paths::deps_ready_path(&deps_id);
+
+    if deps_ready.exists() {
+        return Ok(Some(deps_id));
+    }
+
+    println!("[voidbox] Building shared dependency layer...");
+
+    fs::create_dir_all(&deps_rootfs)?;
+    fs::create_dir_all(&deps_layer)?;
+    fs::create_dir_all(&deps_work)?;
+    if let Some(parent) = deps_ready.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    write_base_info_for_dir(
+        &deps_dir,
+        &BaseInfo {
+            base: manifest.runtime.base.clone(),
+            arch: arch.to_string(),
+            version: base_version.to_string(),
+            deps_id: None,
+        },
+    )?;
+
+    install_dependencies(&deps_rootfs, &deps_layer, &manifest.dependencies.shared)?;
+
+    fs::write(&deps_ready, b"ok")?;
+
+    Ok(Some(deps_id))
+}
+
 fn get_ubuntu_codename(rootfs: &Path) -> String {
     let os_release = rootfs.join("etc/os-release");
     if let Ok(content) = fs::read_to_string(&os_release) {
@@ -488,8 +562,26 @@ fn install_app_binary(
             None,
         ),
         SourceConfig::Direct {
-            url, archive_type, ..
-        } => ("latest".to_string(), url.clone(), archive_type.clone()),
+            url,
+            archive_type,
+            version_url,
+        } => {
+            let mut version = "latest".to_string();
+            if let Some(version_url) = version_url.as_deref() {
+                match fetch_direct_version(version_url) {
+                    Ok(Some(found)) => version = found,
+                    Ok(None) => println!(
+                        "[voidbox] Warning: Could not parse version from {}",
+                        version_url
+                    ),
+                    Err(e) => println!(
+                        "[voidbox] Warning: Could not fetch version from {}: {}",
+                        version_url, e
+                    ),
+                }
+            }
+            (version, url.clone(), archive_type.clone())
+        }
         SourceConfig::Local { path, archive_type } => {
             // Install from local path
             let install_dir = manifest
@@ -624,6 +716,78 @@ fn fetch_github_release(
         "No matching asset found for {} {} in {}/{}",
         asset_os, asset_arch, owner, repo
     )))
+}
+
+fn fetch_direct_version(version_url: &str) -> Result<Option<String>, InstallError> {
+    let content = download_string(version_url)?;
+    Ok(parse_version_response(&content))
+}
+
+fn resolve_bundle_version(manifest: &AppManifest) -> Result<Option<String>, InstallError> {
+    match &manifest.source {
+        SourceConfig::Github {
+            owner,
+            repo,
+            asset_os,
+            asset_arch,
+            asset_extension,
+            ..
+        } => Ok(Some(
+            fetch_github_release(
+                owner,
+                repo,
+                asset_os,
+                asset_arch,
+                asset_extension.as_deref(),
+            )?
+            .0,
+        )),
+        SourceConfig::Direct { version_url, .. } => {
+            if let Some(version_url) = version_url.as_deref() {
+                fetch_direct_version(version_url)
+            } else {
+                Ok(None)
+            }
+        }
+        SourceConfig::Local { .. } => Ok(None),
+    }
+}
+
+fn parse_version_response(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(obj) = value.as_object() {
+            for key in ["productVersion", "version", "name", "tag_name"] {
+                if let Some(version) = obj.get(key).and_then(|v| v.as_str()) {
+                    return Some(version.trim_start_matches('v').to_string());
+                }
+            }
+        }
+
+        if let Some(array) = value.as_array() {
+            for item in array {
+                if let Some(version) = item.as_str() {
+                    return Some(version.trim_start_matches('v').to_string());
+                }
+                if let Some(obj) = item.as_object() {
+                    for key in ["productVersion", "version", "name", "tag_name"] {
+                        if let Some(version) = obj.get(key).and_then(|v| v.as_str()) {
+                            return Some(version.trim_start_matches('v').to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    trimmed
+        .lines()
+        .next()
+        .map(|line| line.trim().trim_start_matches('v').to_string())
 }
 
 fn get_extension_from_url(url: &str) -> String {

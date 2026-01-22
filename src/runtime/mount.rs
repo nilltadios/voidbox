@@ -251,36 +251,79 @@ fn try_mount_overlay(rootfs: &Path) -> Result<bool, MountError> {
     fs::create_dir_all(&layer_dir)?;
     fs::create_dir_all(&work_dir)?;
 
+    let mut lowerdir = base_dir.display().to_string();
+
+    if let Some(deps_id) = &info.deps_id {
+        let deps_rootfs = paths::deps_rootfs_dir(deps_id);
+        let deps_layer = paths::deps_layer_dir(deps_id);
+        let deps_work = paths::deps_work_dir(deps_id);
+
+        fs::create_dir_all(&deps_rootfs)?;
+        fs::create_dir_all(&deps_layer)?;
+        fs::create_dir_all(&deps_work)?;
+
+        let deps_marker = deps_rootfs.join("etc/os-release");
+        if !deps_marker.exists() {
+            let base_lower = base_dir.display().to_string();
+            if let Err(err) = mount_overlay_with_fallback(
+                &deps_rootfs,
+                &base_lower,
+                &deps_layer,
+                &deps_work,
+            ) {
+                eprintln!(
+                    "[voidbox] Warning: deps overlay mount failed: {}",
+                    err
+                );
+            }
+        }
+
+        if deps_marker.exists() {
+            lowerdir = deps_rootfs.display().to_string();
+        } else {
+            lowerdir = format!("{}:{}", deps_layer.display(), base_dir.display());
+        }
+    }
+
+    mount_overlay_with_fallback(rootfs, &lowerdir, &layer_dir, &work_dir)?;
+
+    Ok(true)
+}
+
+fn mount_overlay_with_fallback(
+    target: &Path,
+    lowerdir: &str,
+    upperdir: &Path,
+    workdir: &Path,
+) -> Result<(), MountError> {
     let base_opts = format!(
         "lowerdir={},upperdir={},workdir={}",
-        base_dir.display(),
-        layer_dir.display(),
-        work_dir.display()
+        lowerdir,
+        upperdir.display(),
+        workdir.display()
     );
     let opts_with_xattr = format!("{},userxattr", base_opts);
 
     if mount(
         Some("overlay"),
-        rootfs,
+        target,
         Some("overlay"),
         MsFlags::empty(),
         Some(opts_with_xattr.as_str()),
     )
     .is_ok()
     {
-        return Ok(true);
+        return Ok(());
     }
 
     mount(
         Some("overlay"),
-        rootfs,
+        target,
         Some("overlay"),
         MsFlags::empty(),
         Some(base_opts.as_str()),
     )
-    .map_err(|e| MountError::MountFailed(format!("overlay mount failed: {}", e)))?;
-
-    Ok(true)
+    .map_err(|e| MountError::MountFailed(format!("overlay mount failed: {}", e)))
 }
 
 /// Generate synthetic /etc/passwd content that preserves system users but maps UID 0 to host username

@@ -14,15 +14,65 @@ pub fn bases_dir() -> PathBuf {
     data_dir().join("bases")
 }
 
+/// Get the deps directory (shared dependency layers)
+pub fn deps_dir() -> PathBuf {
+    data_dir().join("deps")
+}
+
 /// Convert a base name + arch to a directory-friendly ID
 pub fn base_id(base: &str, arch: &str) -> String {
     let sanitized = base.replace(':', "-").replace('/', "-");
     format!("{}-{}", sanitized, arch)
 }
 
+/// Convert dependency set to a shared layer ID
+pub fn deps_id(base: &str, arch: &str, packages: &[String]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut normalized = packages
+        .iter()
+        .map(|pkg| pkg.trim())
+        .filter(|pkg| !pkg.is_empty())
+        .map(|pkg| pkg.to_string())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+
+    let mut hasher = DefaultHasher::new();
+    base.hash(&mut hasher);
+    arch.hash(&mut hasher);
+    for pkg in &normalized {
+        pkg.hash(&mut hasher);
+    }
+    let hash = hasher.finish();
+
+    format!("{}-deps-{:016x}", base_id(base, arch), hash)
+}
+
 /// Get the base directory for a specific base + arch
 pub fn base_dir(base: &str, arch: &str) -> PathBuf {
     bases_dir().join(base_id(base, arch))
+}
+
+/// Get the dependency layer directory for a deps ID
+pub fn deps_layer_dir(deps_id: &str) -> PathBuf {
+    deps_dir().join(deps_id).join("layer")
+}
+
+/// Get the dependency work directory for a deps ID
+pub fn deps_work_dir(deps_id: &str) -> PathBuf {
+    deps_dir().join(deps_id).join("work")
+}
+
+/// Get the dependency rootfs directory for a deps ID
+pub fn deps_rootfs_dir(deps_id: &str) -> PathBuf {
+    deps_dir().join(deps_id).join("rootfs")
+}
+
+/// Get the dependency ready marker path
+pub fn deps_ready_path(deps_id: &str) -> PathBuf {
+    deps_layer_dir(deps_id).join(".voidbox/deps-ready")
 }
 
 /// Get the apps directory (per-app layers)
@@ -143,6 +193,7 @@ pub fn database_path() -> PathBuf {
 pub fn ensure_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(data_dir())?;
     std::fs::create_dir_all(bases_dir())?;
+    std::fs::create_dir_all(deps_dir())?;
     std::fs::create_dir_all(apps_dir())?;
     std::fs::create_dir_all(manifests_dir())?;
     std::fs::create_dir_all(settings_dir())?;

@@ -244,7 +244,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Update { app, force } => match app {
-            Some(app_name) => cli::update_app(&app_name, force)?,
+            Some(app_name) => {
+                let _ = cli::update_app(&app_name, force)?;
+            }
             None => cli::update_all(force)?,
         },
 
@@ -327,6 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn uninstall_voidbox(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     use voidbox::manifest::InstalledApp;
+    use voidbox::storage::remove_dir_all_force;
 
     if purge {
         println!("[voidbox] This will remove voidbox and ALL app data.");
@@ -415,7 +418,7 @@ fn uninstall_voidbox(purge: bool) -> Result<(), Box<dyn std::error::Error>> {
         let data_dir = paths::data_dir();
         if data_dir.exists() {
             println!("  Removing data directory (this may take a moment)...");
-            std::fs::remove_dir_all(&data_dir)?;
+            remove_dir_all_force(&data_dir)?;
             println!("  Removed {}", data_dir.display());
         }
     } else {

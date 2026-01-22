@@ -42,13 +42,26 @@ pub fn create_desktop_entry(manifest: &AppManifest) -> Result<(), DesktopError> 
     let keywords = if manifest.desktop.keywords.is_empty() {
         String::new()
     } else {
-        format!("Keywords={}\n", manifest.desktop.keywords.join(";"))
+        format!("Keywords={};\n", manifest.desktop.keywords.join(";"))
     };
 
     let mime_types = if manifest.desktop.mime_types.is_empty() {
         String::new()
     } else {
-        format!("MimeType={}\n", manifest.desktop.mime_types.join(";"))
+        format!("MimeType={};\n", manifest.desktop.mime_types.join(";"))
+    };
+
+    let exec_args = if manifest.desktop.mime_types.is_empty() {
+        ""
+    } else if manifest
+        .desktop
+        .mime_types
+        .iter()
+        .any(|mime| mime.starts_with("x-scheme-handler/"))
+    {
+        " -- %U"
+    } else {
+        " -- %F"
     };
 
     let exec_path = paths::voidbox_exe_path();
@@ -58,7 +71,7 @@ pub fn create_desktop_entry(manifest: &AppManifest) -> Result<(), DesktopError> 
         r#"[Desktop Entry]
 Name={}
 Comment={}
-Exec={} run {}
+Exec={} run {}{}
 Icon={}
 Terminal=false
 Type=Application
@@ -70,6 +83,7 @@ StartupWMClass={}
         manifest.app.description,
         exec_value,
         manifest.app.name,
+        exec_args,
         icon_value,
         categories,
         wm_class,
@@ -78,6 +92,7 @@ StartupWMClass={}
     );
 
     fs::write(&desktop_path, content)?;
+    update_desktop_database();
 
     Ok(())
 }

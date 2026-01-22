@@ -7,7 +7,9 @@
 - **Single Binary**: No external dependencies (no Docker, Podman, or Flatpak required)
 - **Multi-App Support**: Install any app using TOML manifests
 - **Shared Base Images**: OverlayFS base + per-app layers
+- **Shared Dependency Layers**: Deduplicated apt packages across apps
 - **Auto-Install**: First run installs to `~/.local/bin` and creates desktop launchers
+- **File Associations**: MIME handlers for Open With and default apps
 - **.voidbox Installers**: Self-extracting, double-clickable single-file apps
 - **Auto-Update**: Automatically updates apps and voidbox itself
 - **Portable**: Works on Fedora, Ubuntu, Debian, Arch, and more
@@ -45,6 +47,7 @@ chmod +x MyApp.voidbox
 ```
 
 Double-clicking `MyApp.voidbox` opens a GUI installer and requires no terminal.
+Installers download base images and app archives, so an internet connection is required for install.
 
 You can also install from an existing file:
 
@@ -96,7 +99,8 @@ asset_extension = ".zip"
 base = "ubuntu:24.04"
 
 [dependencies]
-packages = ["libnss3", "libgtk-3-0t64", "libpulse0"]
+shared = ["libnss3", "libgtk-3-0t64", "libpulse0"]
+packages = ["libxss1"]
 
 [binary]
 name = "brave"
@@ -105,6 +109,7 @@ args = ["--no-sandbox"]
 [desktop]
 categories = ["Network", "WebBrowser"]
 wm_class = "brave-browser"
+mime_types = ["text/html", "x-scheme-handler/http", "x-scheme-handler/https"]
 
 [permissions]
 network = true
@@ -115,6 +120,16 @@ dev_mode = false
 ```
 
 See `examples/manifests/` for more examples.
+
+Direct sources can add `version_url` to enable update checks:
+
+```toml
+[source]
+type = "direct"
+url = "https://example.com/app.tar.gz"
+version_url = "https://example.com/version.json"
+archive_type = "tar.gz"
+```
 
 ## Building from Source
 
@@ -142,6 +157,8 @@ cargo build --release
 ~/.local/share/voidbox/
 ├── bases/                   # Shared base images
 │   └── ubuntu-24.04-amd64/
+├── deps/                    # Shared dependency layers
+│   └── ubuntu-24.04-amd64-deps-<hash>/
 ├── apps/                    # Per-app installations
 │   └── brave/
 │       ├── base.json        # Base metadata

@@ -104,6 +104,8 @@ impl Default for RuntimeConfig {
 pub struct DependencyConfig {
     #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default)]
+    pub shared: Vec<String>,
 }
 
 /// Binary configuration

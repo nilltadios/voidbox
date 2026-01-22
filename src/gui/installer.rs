@@ -279,6 +279,12 @@ impl eframe::App for InstallerApp {
                                             .size(13.0)
                                             .color(TEXT_SECONDARY),
                                     );
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new("Internet connection required for install")
+                                            .size(11.0)
+                                            .color(TEXT_SECONDARY),
+                                    );
                                 }
                             }
                             ui.add_space(35.0);

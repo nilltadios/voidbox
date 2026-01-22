@@ -2,8 +2,9 @@
 
 use crate::cli::install::install_app;
 use crate::manifest::{InstalledApp, SourceConfig, parse_manifest_file};
-use crate::storage::paths;
+use crate::storage::{download_string, paths};
 use serde::Deserialize;
+use serde_json::Value;
 use std::fs;
 use thiserror::Error;
 
@@ -21,8 +22,19 @@ pub enum UpdateError {
     #[error("Manifest error: {0}")]
     ManifestError(#[from] crate::manifest::ManifestError),
 
+    #[error("Download error: {0}")]
+    DownloadError(#[from] crate::storage::DownloadError),
+
     #[error("Update failed: {0}")]
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UpdateOutcome {
+    Updated,
+    UpToDate,
+    Skipped,
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +63,48 @@ fn get_latest_github_version(owner: &str, repo: &str) -> Result<String, UpdateEr
         .map_err(|e| UpdateError::Failed(format!("Failed to parse GitHub response: {}", e)))?;
 
     Ok(release.tag_name.trim_start_matches('v').to_string())
+}
+
+fn get_latest_direct_version(version_url: &str) -> Result<Option<String>, UpdateError> {
+    let content = download_string(version_url)?;
+    Ok(parse_version_response(&content))
+}
+
+fn parse_version_response(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        if let Some(obj) = value.as_object() {
+            for key in ["productVersion", "version", "name", "tag_name"] {
+                if let Some(version) = obj.get(key).and_then(|v| v.as_str()) {
+                    return Some(version.trim_start_matches('v').to_string());
+                }
+            }
+        }
+
+        if let Some(array) = value.as_array() {
+            for item in array {
+                if let Some(version) = item.as_str() {
+                    return Some(version.trim_start_matches('v').to_string());
+                }
+                if let Some(obj) = item.as_object() {
+                    for key in ["productVersion", "version", "name", "tag_name"] {
+                        if let Some(version) = obj.get(key).and_then(|v| v.as_str()) {
+                            return Some(version.trim_start_matches('v').to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    trimmed
+        .lines()
+        .next()
+        .map(|line| line.trim().trim_start_matches('v').to_string())
 }
 
 /// Get installed version of an app
@@ -83,7 +137,7 @@ fn is_newer_version(installed: &str, latest: &str) -> bool {
 }
 
 /// Update a specific app
-pub fn update_app(app_name: &str, force: bool) -> Result<(), UpdateError> {
+pub fn update_app(app_name: &str, force: bool) -> Result<UpdateOutcome, UpdateError> {
     let manifest_path = paths::manifest_path(app_name);
 
     if !manifest_path.exists() {
@@ -95,32 +149,85 @@ pub fn update_app(app_name: &str, force: bool) -> Result<(), UpdateError> {
     let display_name = &manifest.app.display_name;
 
     // Get installed version
-    let installed_version = get_installed_version(app_name);
+    let installed_version = get_installed_version(app_name).or_else(|| manifest.app.version.clone());
 
     // Check for updates based on source type
     let latest_version = match &manifest.source {
         SourceConfig::Github { owner, repo, .. } => Some(get_latest_github_version(owner, repo)?),
-        SourceConfig::Direct { .. } => None, // Can't check version for direct URLs
-        SourceConfig::Local { .. } => None,  // Local sources don't have remote versions
+        SourceConfig::Direct { version_url, .. } => match version_url.as_deref() {
+            Some(url) => get_latest_direct_version(url)?,
+            None => None,
+        },
+        SourceConfig::Local { .. } => None,
     };
 
     // Compare versions
     if !force {
-        if let (Some(installed), Some(latest)) = (&installed_version, &latest_version) {
-            if !is_newer_version(installed, latest) {
-                println!("[voidbox] {} is up to date (v{})", display_name, installed);
-                return Ok(());
+        match &manifest.source {
+            SourceConfig::Github { .. } => {
+                let Some(latest) = latest_version.as_deref() else {
+                    println!(
+                        "[voidbox] {} - cannot check for updates right now",
+                        display_name
+                    );
+                    return Ok(UpdateOutcome::Unknown);
+                };
+                let Some(installed) = installed_version.as_deref() else {
+                    println!(
+                        "[voidbox] {} - cannot determine installed version (use --force to update)",
+                        display_name
+                    );
+                    return Ok(UpdateOutcome::Unknown);
+                };
+                if !is_newer_version(installed, latest) {
+                    println!("[voidbox] {} is up to date (v{})", display_name, installed);
+                    return Ok(UpdateOutcome::UpToDate);
+                }
+                println!(
+                    "[voidbox] {} update available: v{} -> v{}",
+                    display_name, installed, latest
+                );
             }
-            println!(
-                "[voidbox] {} update available: v{} -> v{}",
-                display_name, installed, latest
-            );
-        } else if installed_version.is_some() && latest_version.is_none() {
-            println!(
-                "[voidbox] {} - cannot check for updates (non-GitHub source)",
-                display_name
-            );
-            return Ok(());
+            SourceConfig::Direct { version_url, .. } => match version_url {
+                Some(_) => {
+                    let Some(latest) = latest_version.as_deref() else {
+                        println!(
+                            "[voidbox] {} - cannot check for updates right now",
+                            display_name
+                        );
+                        return Ok(UpdateOutcome::Unknown);
+                    };
+                    let Some(installed) = installed_version.as_deref() else {
+                        println!(
+                            "[voidbox] {} - cannot determine installed version (use --force to update)",
+                            display_name
+                        );
+                        return Ok(UpdateOutcome::Unknown);
+                    };
+                    if !is_newer_version(installed, latest) {
+                        println!("[voidbox] {} is up to date (v{})", display_name, installed);
+                        return Ok(UpdateOutcome::UpToDate);
+                    }
+                    println!(
+                        "[voidbox] {} update available: v{} -> v{}",
+                        display_name, installed, latest
+                    );
+                }
+                None => {
+                    println!(
+                        "[voidbox] {} - cannot check for updates (direct source)",
+                        display_name
+                    );
+                    return Ok(UpdateOutcome::Skipped);
+                }
+            },
+            SourceConfig::Local { .. } => {
+                println!(
+                    "[voidbox] {} - cannot check for updates (local source)",
+                    display_name
+                );
+                return Ok(UpdateOutcome::Skipped);
+            }
         }
     }
 
@@ -129,7 +236,7 @@ pub fn update_app(app_name: &str, force: bool) -> Result<(), UpdateError> {
     // Reinstall the app (force=true to overwrite)
     install_app(manifest_path.to_str().unwrap(), true)?;
 
-    Ok(())
+    Ok(UpdateOutcome::Updated)
 }
 
 /// Update all installed apps
@@ -154,18 +261,16 @@ pub fn update_all(force: bool) -> Result<(), UpdateError> {
 
     let mut updated = 0;
     let mut up_to_date = 0;
+    let mut skipped = 0;
+    let mut unknown = 0;
     let mut failed = 0;
 
     for app in &apps {
         match update_app(&app.name, force) {
-            Ok(()) => {
-                // Check if it was actually updated or already up to date
-                // by looking at the output (the function prints its status)
-                updated += 1;
-            }
-            Err(UpdateError::Failed(msg)) if msg.contains("up to date") => {
-                up_to_date += 1;
-            }
+            Ok(UpdateOutcome::Updated) => updated += 1,
+            Ok(UpdateOutcome::UpToDate) => up_to_date += 1,
+            Ok(UpdateOutcome::Skipped) => skipped += 1,
+            Ok(UpdateOutcome::Unknown) => unknown += 1,
             Err(e) => {
                 println!("[voidbox] Failed to update {}: {}", app.name, e);
                 failed += 1;
@@ -174,10 +279,20 @@ pub fn update_all(force: bool) -> Result<(), UpdateError> {
     }
 
     println!("[voidbox] Update check complete!");
-    if updated > 0 || up_to_date > 0 || failed > 0 {
-        if failed > 0 {
-            println!("  {} failed", failed);
-        }
+    if updated > 0 {
+        println!("  {} updated", updated);
+    }
+    if up_to_date > 0 {
+        println!("  {} up to date", up_to_date);
+    }
+    if skipped > 0 {
+        println!("  {} skipped", skipped);
+    }
+    if unknown > 0 {
+        println!("  {} unknown", unknown);
+    }
+    if failed > 0 {
+        println!("  {} failed", failed);
     }
 
     Ok(())

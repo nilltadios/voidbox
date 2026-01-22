@@ -11,6 +11,8 @@ pub struct BaseInfo {
     pub base: String,
     pub arch: String,
     pub version: String,
+    #[serde(default)]
+    pub deps_id: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -26,8 +28,14 @@ pub enum BaseInfoError {
 }
 
 pub fn write_base_info(app_name: &str, info: &BaseInfo) -> Result<(), BaseInfoError> {
-    let path = paths::app_base_info_path(app_name);
+    let app_dir = paths::app_dir(app_name);
+    write_base_info_for_dir(&app_dir, info)
+}
+
+pub fn write_base_info_for_dir(dir: &Path, info: &BaseInfo) -> Result<(), BaseInfoError> {
+    let path = dir.join("base.json");
     let content = serde_json::to_string_pretty(info)?;
+    fs::create_dir_all(dir)?;
     fs::write(path, content)?;
     Ok(())
 }

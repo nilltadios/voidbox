@@ -11,7 +11,7 @@ A universal Linux application platform that prioritizes portability and usabilit
 ## Table of Contents
 
 1. [Philosophy](#philosophy)
-2. [Current State (v0.7.0)](#current-state-v070)
+2. [Current State (v0.7.1)](#current-state-v071)
 3. [Competitor Analysis](#competitor-analysis)
 4. [Target Users](#target-users)
 5. [Architecture](#architecture)
@@ -64,7 +64,7 @@ A universal Linux application platform that prioritizes portability and usabilit
 
 ---
 
-## Current State (v0.7.0)
+## Current State (v0.7.1)
 
 ### What Works
 
@@ -79,6 +79,9 @@ A universal Linux application platform that prioritizes portability and usabilit
 | .voidbox self-extracting installers | ✅ |
 | Auto-update (self) | ✅ |
 | Auto-update (target app) | ✅ |
+| Shared dependency layers (dedupe apt) | ✅ |
+| Desktop file associations (Open With) | ✅ |
+| Direct source update checks (version_url) | ✅ |
 | GPU passthrough | ✅ |
 | Audio passthrough (PulseAudio/PipeWire) | ✅ |
 | Wayland/X11 support | ✅ |
@@ -107,6 +110,7 @@ voidbox (single binary, ~5MB)
 ┌─────────────────────────────────────────┐
 │    ~/.local/share/voidbox/              │
 │    ├── bases/ubuntu-24.04-amd64/         │
+│    ├── deps/ubuntu-24.04-amd64-deps-.../ │
 │    ├── apps/brave/                       │
 │    │   ├── base.json                     │
 │    │   ├── layer/                        │
@@ -1276,6 +1280,14 @@ MIT
 ---
 
 ## Changelog
+
+### v0.7.1
+- **Feature:** Shared dependency layers via `dependencies.shared`
+- **Feature:** Desktop file associations via `MimeType` (Open With)
+- **Feature:** Direct source update checks via `version_url`
+- **Fix:** Bundle installs record resolved versions
+- **Fix:** Purge uninstall handles permissioned overlay workdirs
+- **Docs:** GUI installer notes internet requirement for installs
 
 ### v0.7.0
 - **Feature:** Shared base images via OverlayFS with per-app layers

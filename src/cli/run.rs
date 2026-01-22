@@ -175,11 +175,6 @@ fn build_command(
     url: Option<&str>,
     rootfs: &Path,
 ) -> Result<(String, Vec<String>), RunError> {
-    if !args.is_empty() {
-        // Custom command specified
-        return Ok((args[0].clone(), args[1..].to_vec()));
-    }
-
     // Default app command
     let binary_name = &manifest.binary.name;
 
@@ -189,6 +184,7 @@ fn build_command(
         .unwrap_or_else(|| format!("/usr/bin/{}", binary_name));
 
     let mut cmd_args: Vec<String> = manifest.binary.args.clone();
+    cmd_args.extend(args.iter().cloned());
 
     // Add URL if specified (for browsers)
     if let Some(u) = url {
