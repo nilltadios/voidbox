@@ -1,6 +1,6 @@
 [package]
 name = "voidbox"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2024"
 description = "Universal Linux App Platform - portable, isolated application environments"
 license = "MIT"

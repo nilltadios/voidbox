@@ -710,5 +710,11 @@ pub fn setup_container_env(permissions: &PermissionConfig) {
         if let Ok(dbus_addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
             std::env::set_var("DBUS_SESSION_BUS_ADDRESS", dbus_addr);
         }
+
+        // In non-native mode, remove desktop environment variables that can break
+        // GTK apps (e.g., DCONF_PROFILE pointing to non-existent profiles)
+        if !permissions.native_mode {
+            std::env::remove_var("DCONF_PROFILE");
+        }
     }
 }
