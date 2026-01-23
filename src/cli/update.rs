@@ -2,10 +2,13 @@
 
 use crate::cli::install::install_app;
 use crate::manifest::{InstalledApp, SourceConfig, parse_manifest_file};
-use crate::storage::{download_string, paths};
+use crate::storage::{paths, download_string, BaseInfo};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -239,7 +242,107 @@ pub fn update_app(app_name: &str, force: bool) -> Result<UpdateOutcome, UpdateEr
     Ok(UpdateOutcome::Updated)
 }
 
-/// Update all installed apps
+/// Read base info from a base.json file
+fn read_base_json(path: &Path) -> Option<BaseInfo> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Get all unique deps_ids from installed apps
+fn get_all_deps_ids() -> Result<HashSet<String>, UpdateError> {
+    let mut deps_ids = HashSet::new();
+    let apps_dir = paths::apps_dir();
+
+    if !apps_dir.exists() {
+        return Ok(deps_ids);
+    }
+
+    for entry in fs::read_dir(&apps_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            let base_json = entry.path().join("base.json");
+            if let Some(info) = read_base_json(&base_json) {
+                if let Some(deps_id) = info.deps_id {
+                    deps_ids.insert(deps_id);
+                }
+            }
+        }
+    }
+
+    Ok(deps_ids)
+}
+
+/// Upgrade system packages in a deps layer
+fn upgrade_deps_layer(deps_id: &str) -> Result<(), UpdateError> {
+    let deps_rootfs = paths::deps_rootfs_dir(deps_id);
+    let deps_layer = paths::deps_layer_dir(deps_id);
+
+    if !deps_rootfs.exists() {
+        return Err(UpdateError::Failed(format!(
+            "Deps layer not found: {}",
+            deps_id
+        )));
+    }
+
+    println!("[voidbox] Upgrading system packages in {}...", deps_id);
+
+    // Create upgrade script
+    let upgrade_script = r#"#!/bin/bash
+export DEBIAN_FRONTEND=noninteractive
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+echo "Updating package lists..."
+apt-get update -qq
+
+echo "Upgrading packages..."
+apt-get upgrade -y --no-install-recommends 2>&1
+
+echo "Cleaning up..."
+apt-get autoremove -y 2>/dev/null || true
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+
+echo "System packages upgraded!"
+"#;
+
+    let script_path = deps_layer.join("upgrade.sh");
+    fs::write(&script_path, upgrade_script)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Run upgrade script using voidbox internal-run
+    let voidbox_exe = paths::install_path();
+    let exe_to_use = if voidbox_exe.exists() {
+        voidbox_exe
+    } else {
+        std::env::current_exe()?
+    };
+
+    let status = Command::new(&exe_to_use)
+        .args(["internal-run", deps_rootfs.to_str().unwrap(), "/upgrade.sh"])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| UpdateError::Failed(format!("Failed to run upgrade: {}", e)))?;
+
+    // Clean up script
+    fs::remove_file(&script_path).ok();
+
+    if !status.success() {
+        return Err(UpdateError::Failed(format!(
+            "Upgrade failed with exit code: {:?}",
+            status.code()
+        )));
+    }
+
+    Ok(())
+}
+
+/// Update all installed apps and system packages
 pub fn update_all(force: bool) -> Result<(), UpdateError> {
     let db_path = paths::database_path();
 
@@ -257,7 +360,26 @@ pub fn update_all(force: bool) -> Result<(), UpdateError> {
         return Ok(());
     }
 
-    println!("[voidbox] Checking {} app(s) for updates...", apps.len());
+    // First, upgrade system packages in all shared deps layers
+    let deps_ids = get_all_deps_ids()?;
+    if !deps_ids.is_empty() {
+        println!(
+            "[voidbox] Upgrading system packages in {} shared layer(s)...",
+            deps_ids.len()
+        );
+        for deps_id in &deps_ids {
+            if let Err(e) = upgrade_deps_layer(deps_id) {
+                println!("[voidbox] Warning: Failed to upgrade {}: {}", deps_id, e);
+            }
+        }
+        println!("[voidbox] System packages upgraded.");
+    }
+
+    // Then check and update app binaries
+    println!(
+        "[voidbox] Checking {} app(s) for updates...",
+        apps.len()
+    );
 
     let mut updated = 0;
     let mut up_to_date = 0;
