@@ -70,7 +70,7 @@ shared = [
 [binary]
 name = "brave"
 install_dir = "brave"
-args = ["--no-sandbox", "--disable-dev-shm-usage", "--test-type"]
+args = ["--no-sandbox", "--disable-dev-shm-usage", "--test-type", "--password-store=basic"]
 
 [desktop]
 categories = ["Network", "WebBrowser"]

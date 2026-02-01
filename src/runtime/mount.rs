@@ -285,9 +285,112 @@ fn try_mount_overlay(rootfs: &Path) -> Result<bool, MountError> {
         }
     }
 
-    mount_overlay_with_fallback(rootfs, &lowerdir, &layer_dir, &work_dir)?;
+    // Try overlay mount first
+    if let Err(overlay_err) = mount_overlay_with_fallback(rootfs, &lowerdir, &layer_dir, &work_dir) {
+        // Overlay failed (likely kernel < 5.11), use copy-based fallback
+        eprintln!("[voidbox] Overlay not available, using copy fallback (kernel < 5.11?)");
+
+        // Check if we already have a merged rootfs from a previous copy
+        let marker = rootfs.join("etc/os-release");
+        if !marker.exists() {
+            // Need to copy base + layer to rootfs
+            copy_layers_to_rootfs(rootfs, &base_dir, &layer_dir, info.deps_id.as_ref())?;
+        }
+
+        // Bind mount the copied rootfs
+        mount(
+            Some(rootfs),
+            rootfs,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(|e| MountError::MountFailed(format!("bind rootfs fallback: {}", e)))?;
+
+        return Ok(true);
+    }
 
     Ok(true)
+}
+
+/// Copy base layer and app layer to rootfs when overlay is not available
+/// Uses hardlinks for base layer to save disk space, falls back to regular copy
+fn copy_layers_to_rootfs(
+    rootfs: &Path,
+    base_dir: &Path,
+    layer_dir: &Path,
+    deps_id: Option<&String>,
+) -> Result<(), MountError> {
+    use std::process::Command;
+
+    eprintln!("[voidbox] Linking base layer to rootfs (one-time operation)...");
+
+    // Try to use cp -al (hardlinks) first to save disk space
+    // This creates hardlinks for files, so they share the same disk blocks
+    let status = Command::new("cp")
+        .args(["-al"])
+        .arg(format!("{}/.", base_dir.display()))
+        .arg(rootfs)
+        .status();
+
+    let hardlink_failed = match status {
+        Ok(s) if s.success() => false,
+        _ => {
+            // Hardlinks failed (maybe cross-filesystem), fall back to reflink/copy
+            eprintln!("[voidbox] Hardlinks not available, using copy...");
+            let status = Command::new("cp")
+                .args(["-a", "--reflink=auto"])
+                .arg(format!("{}/.", base_dir.display()))
+                .arg(rootfs)
+                .status()
+                .map_err(|e| MountError::MountFailed(format!("cp base: {}", e)))?;
+
+            if !status.success() {
+                return Err(MountError::MountFailed("failed to copy base layer".to_string()));
+            }
+            true
+        }
+    };
+
+    // Copy deps rootfs if exists (this contains the installed dependencies)
+    if let Some(deps_id) = deps_id {
+        let deps_rootfs = paths::deps_rootfs_dir(deps_id);
+        if deps_rootfs.exists() && deps_rootfs.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
+            eprintln!("[voidbox] Copying dependency layer...");
+            let status = Command::new("cp")
+                .args(["-a", "--reflink=auto", "--remove-destination"])
+                .arg(format!("{}/.", deps_rootfs.display()))
+                .arg(rootfs)
+                .status()
+                .map_err(|e| MountError::MountFailed(format!("cp deps: {}", e)))?;
+
+            if !status.success() {
+                eprintln!("[voidbox] Warning: failed to copy deps layer");
+            }
+        }
+    }
+
+    // Copy app layer on top (always copy, not hardlink, to allow modifications)
+    if layer_dir.exists() && layer_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
+        eprintln!("[voidbox] Copying app layer...");
+        let status = Command::new("cp")
+            .args(["-a", "--reflink=auto", "--remove-destination"])
+            .arg(format!("{}/.", layer_dir.display()))
+            .arg(rootfs)
+            .status()
+            .map_err(|e| MountError::MountFailed(format!("cp layer: {}", e)))?;
+
+        if !status.success() {
+            eprintln!("[voidbox] Warning: failed to copy app layer");
+        }
+    }
+
+    if hardlink_failed {
+        eprintln!("[voidbox] Copy fallback complete.");
+    } else {
+        eprintln!("[voidbox] Hardlink fallback complete (space-efficient).");
+    }
+    Ok(())
 }
 
 fn mount_overlay_with_fallback(

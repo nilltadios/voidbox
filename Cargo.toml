@@ -31,7 +31,7 @@ walkdir = "2"
 indicatif = "0.18"
 which = "7.0"
 chrono = "0.4"
-self_update = { version = "0.42", features = ["archive-tar", "compression-flate2"] }
+self_update = { version = "0.42", default-features = false, features = ["archive-tar", "compression-flate2", "rustls"] }
 semver = "1.0"
 thiserror = "2.0"
 atty = "0.2"
